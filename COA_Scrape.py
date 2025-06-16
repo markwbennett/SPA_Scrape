@@ -21,27 +21,15 @@ BAR_NUMBERS = [
     "24031632"
 ]
 
-# All Texas Court of Appeals codes
-COURT_CODES = [
-    "coa01",  # 1st Court of Appeals
-    "coa02",  # 2nd Court of Appeals
-    "coa03",  # 3rd Court of Appeals
-    "coa04",  # 4th Court of Appeals
-    "coa05",  # 5th Court of Appeals
-    "coa06",  # 6th Court of Appeals
-    "coa07",  # 7th Court of Appeals
-    "coa08",  # 8th Court of Appeals
-    "coa09",  # 9th Court of Appeals
-    "coa10",  # 10th Court of Appeals
-    "coa11",  # 11th Court of Appeals
-    "coa12",  # 12th Court of Appeals
-    "coa13",  # 13th Court of Appeals
-    "coa14",  # 14th Court of Appeals
-    "cossup"  # Supreme Court
-]
+# Use "All Courts" option to search all 17 Texas courts at once
+# (15 Courts of Appeals + Supreme Court + Court of Criminal Appeals)
+USE_ALL_COURTS = True
 
 def setup_browser(headless=False):
     """Configure and return a Chrome browser instance"""
+    import tempfile
+    import shutil
+    
     options = webdriver.ChromeOptions()
     
     if headless:
@@ -50,8 +38,15 @@ def setup_browser(headless=False):
         options.add_argument('--no-sandbox')
         options.add_argument('--window-size=1920,1080')
     
+    # Create unique temporary directory for Chrome user data
+    temp_dir = tempfile.mkdtemp(prefix='chrome_scraper_')
+    
     # Add options to handle potential issues
     options.add_argument('--disable-blink-features=AutomationControlled')
+    options.add_argument(f'--user-data-dir={temp_dir}')
+    options.add_argument('--no-first-run')
+    options.add_argument('--disable-extensions')
+    options.add_argument('--disable-dev-shm-usage')
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
     options.add_experimental_option('useAutomationExtension', False)
     
@@ -60,81 +55,170 @@ def setup_browser(headless=False):
     
     return driver
 
-def search_by_attorney_bar_number(driver, bar_number, court_code):
-    """Search for cases by attorney bar number in a specific court"""
-    print(f"Searching for bar number {bar_number} in court {court_code}")
+def search_by_attorney_bar_number(driver, bar_number):
+    """Search for cases by attorney bar number across all Texas courts"""
+    print(f"\n🔍 Searching for bar number {bar_number} across all Texas courts")
     
-    # Navigate to search page for specific court
-    search_url = f"https://search.txcourts.gov/CaseSearch.aspx?coa={court_code}"
+    # Navigate to search page
+    search_url = "https://search.txcourts.gov/CaseSearch.aspx"
+    print(f"📄 Navigating to: {search_url}")
     driver.get(search_url)
     
     try:
         # Wait for page to load
+        print("⏳ Waiting for search page to load...")
         WebDriverWait(driver, 30).until(
-            EC.presence_of_element_located((By.ID, "ctl00_ContentPlaceHolder1_txtAttyBarNumber"))
+            EC.presence_of_element_located((By.ID, "ctl00_ContentPlaceHolder1_txtAttorneyNameOrBarNumber"))
         )
+        print("✅ Search page loaded successfully")
+        
+        # Debug: Check what elements are actually on the page
+        print("🔍 Debugging: Checking page elements...")
+        page_title = driver.title
+        print(f"📄 Page title: {page_title}")
+        
+        # Check if we can find key elements
+        elements_to_check = [
+            ("ctl00_ContentPlaceHolder1_txtAttorneyNameOrBarNumber", "Attorney bar number field"),
+            ("ctl00_ContentPlaceHolder1_chkAllCourts", "All Courts checkbox"),
+            ("ctl00_ContentPlaceHolder1_chkExcludeInactive", "Exclude inactive checkbox"),
+            ("ctl00_ContentPlaceHolder1_btnSearch", "Search button")
+        ]
+        
+        for element_id, description in elements_to_check:
+            try:
+                element = driver.find_element(By.ID, element_id)
+                print(f"✅ Found: {description}")
+            except:
+                print(f"❌ Missing: {description} (ID: {element_id})")
+        
+        # Check "All Courts" checkbox to search across all 17 courts
+        print("🏛️ Selecting 'All Courts' option...")
+        try:
+            all_courts_checkbox = driver.find_element(By.ID, "ctl00_ContentPlaceHolder1_chkAllCourts")
+            if not all_courts_checkbox.is_selected():
+                all_courts_checkbox.click()
+                print("✅ Selected 'All Courts' option (17 courts)")
+            else:
+                print("✅ 'All Courts' option already selected")
+        except Exception as e:
+            print(f"❌ Warning: Could not select 'All Courts' checkbox: {str(e)}")
         
         # Clear and enter bar number in attorney bar number field
-        bar_number_field = driver.find_element(By.ID, "ctl00_ContentPlaceHolder1_txtAttyBarNumber")
+        print(f"📝 Entering bar number: {bar_number}")
+        bar_number_field = driver.find_element(By.ID, "ctl00_ContentPlaceHolder1_txtAttorneyNameOrBarNumber")
         bar_number_field.clear()
         bar_number_field.send_keys(bar_number)
+        print("✅ Bar number entered")
         
-        # Set case status to "Active" only (exclude inactive cases)
+        # Check "Exclude" checkbox to exclude inactive cases
+        print("🚫 Setting to exclude inactive cases...")
         try:
-            status_dropdown = Select(driver.find_element(By.ID, "ctl00_ContentPlaceHolder1_ddlCaseStatus"))
-            status_dropdown.select_by_visible_text("Active")
-        except:
-            print(f"Warning: Could not set case status filter for {court_code}")
+            exclude_inactive_checkbox = driver.find_element(By.ID, "ctl00_ContentPlaceHolder1_chkExcludeInactive")
+            if not exclude_inactive_checkbox.is_selected():
+                exclude_inactive_checkbox.click()
+                print("✅ Selected 'Exclude' inactive cases option")
+            else:
+                print("✅ 'Exclude' inactive cases already selected")
+        except Exception as e:
+            print(f"❌ Warning: Could not select 'Exclude' inactive cases checkbox: {str(e)}")
         
         # Click search button
+        print("🔍 Initiating search...")
         search_button = driver.find_element(By.ID, "ctl00_ContentPlaceHolder1_btnSearch")
         search_button.click()
+        print("⏳ Search submitted, waiting for response...")
+        time.sleep(3)  # Give the server time to process the request
         
         # Wait for results or no results message
+        print("⏳ Waiting for search results...")
         try:
             # Wait for either results table or no results message
-            WebDriverWait(driver, 30).until(
+            WebDriverWait(driver, 60).until(  # Increased timeout to 60 seconds
                 EC.any_of(
                     EC.presence_of_element_located((By.ID, "ctl00_ContentPlaceHolder1_grdCases_ctl00")),
-                    EC.presence_of_element_located((By.CLASS_NAME, "rgNoRecords"))
+                    EC.presence_of_element_located((By.CLASS_NAME, "rgNoRecords")),
+                    EC.presence_of_element_located((By.XPATH, "//span[contains(text(), 'No records')]"))
                 )
             )
-        except:
-            print(f"Timeout waiting for search results in {court_code}")
+            print("✅ Search results loaded")
+            
+            # Debug: Check what we got
+            current_url = driver.current_url
+            print(f"📍 Current URL: {current_url}")
+            
+        except Exception as e:
+            print(f"❌ Timeout waiting for search results: {str(e)}")
+            print(f"📍 Current URL: {driver.current_url}")
             return []
         
         # Check if no results
         no_results = driver.find_elements(By.CLASS_NAME, "rgNoRecords")
         if no_results:
-            print(f"No cases found for bar number {bar_number} in {court_code}")
+            print(f"📭 No cases found for bar number {bar_number}")
             return []
         
         # Extract case numbers from all pages
         case_numbers = []
         page_num = 1
         
+        # Try to get total count from page info
+        try:
+            # Look for pagination info that might show total results
+            page_info_elements = driver.find_elements(By.CSS_SELECTOR, ".rgInfoPart, .rgWrap, .rgPager")
+            for element in page_info_elements:
+                text = element.text.strip()
+                if "of" in text.lower() and any(char.isdigit() for char in text):
+                    print(f"📊 Pagination info: {text}")
+        except:
+            pass
+        
         while True:
-            print(f"Processing page {page_num} for {court_code}")
+            print(f"📄 Processing page {page_num}")
             
             # Get current page results
             soup = BeautifulSoup(driver.page_source, 'html.parser')
             page_cases = get_case_numbers_from_page(soup)
             
             if not page_cases:
-                print(f"No cases found on page {page_num}")
+                print(f"📭 No cases found on page {page_num}")
                 break
                 
             case_numbers.extend(page_cases)
-            print(f"Found {len(page_cases)} cases on page {page_num}")
+            print(f"✅ Found {len(page_cases)} cases on page {page_num}")
             
-            # Check for next page
-            next_buttons = driver.find_elements(By.CSS_SELECTOR, "input.rgPageNext[title='Next Page']")
-            if not next_buttons or not next_buttons[0].is_enabled():
-                print(f"No more pages for {court_code}")
+            # Check for next page - try multiple selectors
+            next_button = None
+            next_selectors = [
+                "input.rgPageNext[title='Next Page']",
+                "input[title='Next Page']",
+                "a[title='Next Page']",
+                ".rgPageNext",
+                "input[value='Next']"
+            ]
+            
+            for selector in next_selectors:
+                next_buttons = driver.find_elements(By.CSS_SELECTOR, selector)
+                if next_buttons and next_buttons[0].is_enabled():
+                    next_button = next_buttons[0]
+                    print(f"✅ Found next page button with selector: {selector}")
+                    break
+            
+            if not next_button:
+                print(f"🏁 No more pages - pagination complete (tried {len(next_selectors)} selectors)")
                 break
             
             # Click next page
-            driver.execute_script("arguments[0].click();", next_buttons[0])
+            print(f"➡️ Moving to page {page_num + 1}")
+            try:
+                driver.execute_script("arguments[0].click();", next_button)
+            except Exception as e:
+                print(f"❌ Error clicking next page: {str(e)}")
+                try:
+                    next_button.click()
+                except:
+                    print("❌ Both JavaScript and regular click failed")
+                    break
             page_num += 1
             
             # Wait for new page to load
@@ -144,13 +228,21 @@ def search_by_attorney_bar_number(driver, bar_number, court_code):
                 )
                 time.sleep(2)  # Additional wait for page stability
             except:
-                print(f"Timeout waiting for page {page_num} in {court_code}")
+                print(f"❌ Timeout waiting for page {page_num}")
                 break
         
+        print(f"📈 Pagination complete: Found {len(case_numbers)} total cases across {page_num} pages")
         return case_numbers
         
     except Exception as e:
-        print(f"Error searching {court_code} for bar number {bar_number}: {str(e)}")
+        print(f"❌ Error searching for bar number {bar_number}: {str(e)}")
+        # Save page source for debugging
+        try:
+            with open(f"error_page_source_{bar_number}.html", "w") as f:
+                f.write(driver.page_source)
+            print(f"📄 Page source saved: error_page_source_{bar_number}.html")
+        except:
+            pass
         return []
 
 def get_case_numbers_from_page(soup):
@@ -340,54 +432,69 @@ def extract_document_links(soup, case_number):
 
 def scrape_attorney_cases():
     """Main function to scrape cases for specific attorney bar numbers"""
+    print("🚀 Starting Texas Court of Appeals Case Scraper")
+    print("=" * 60)
+    
     # Create timestamped output folder
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     output_folder = os.path.join(BASE_DIR, f"attorney_cases_{timestamp}")
     os.makedirs(output_folder, exist_ok=True)
     
-    print(f"Output folder: {output_folder}")
-    print(f"Searching for bar numbers: {', '.join(BAR_NUMBERS)}")
-    print(f"Searching across {len(COURT_CODES)} courts")
+    print(f"📁 Output folder: {output_folder}")
+    print(f"🎯 Target bar numbers: {', '.join(BAR_NUMBERS)}")
+    print("🏛️ Searching across all 17 Texas courts:")
+    print("   • 15 Courts of Appeals (1st-15th)")
+    print("   • Supreme Court of Texas (SCOTX)")
+    print("   • Court of Criminal Appeals (CCA)")
+    print("🚫 Excluding inactive cases")
+    print("=" * 60)
     
     # Start browser
-    print("Starting browser...")
-    driver = setup_browser(headless=False)
+    print("🌐 Starting Chrome browser (headless mode)...")
+    driver = setup_browser(headless=True)
+    print("✅ Browser started successfully")
     
     all_cases = {}
     all_case_details = []
     
     try:
-        # Search each court for each bar number
-        for bar_number in BAR_NUMBERS:
-            print(f"\n=== Searching for Bar Number: {bar_number} ===")
-            bar_cases = []
+        # Search all courts for each bar number
+        for i, bar_number in enumerate(BAR_NUMBERS, 1):
+            print(f"\n{'='*20} BAR NUMBER {i}/{len(BAR_NUMBERS)} {'='*20}")
+            print(f"🎯 Target: {bar_number}")
             
-            for court_code in COURT_CODES:
-                try:
-                    cases = search_by_attorney_bar_number(driver, bar_number, court_code)
-                    if cases:
-                        print(f"Found {len(cases)} cases in {court_code}")
-                        bar_cases.extend(cases)
-                    time.sleep(2)  # Brief pause between court searches
-                except Exception as e:
-                    print(f"Error searching {court_code}: {str(e)}")
-                    continue
-            
-            # Remove duplicates
-            unique_cases = list(set(bar_cases))
-            all_cases[bar_number] = unique_cases
-            print(f"Total unique cases for {bar_number}: {len(unique_cases)}")
+            try:
+                cases = search_by_attorney_bar_number(driver, bar_number)
+                all_cases[bar_number] = cases
+                print(f"✅ Search complete: Found {len(cases)} cases for {bar_number}")
+                if i < len(BAR_NUMBERS):
+                    print("⏳ Pausing 3 seconds before next search...")
+                    time.sleep(3)  # Brief pause between bar number searches
+            except Exception as e:
+                print(f"❌ Error searching for bar number {bar_number}: {str(e)}")
+                all_cases[bar_number] = []
+                continue
         
         # Get all unique case numbers across all bar numbers
         all_unique_cases = set()
         for cases in all_cases.values():
             all_unique_cases.update(cases)
         
-        print(f"\nTotal unique cases across all bar numbers: {len(all_unique_cases)}")
+        print(f"\n📊 SEARCH SUMMARY")
+        print("=" * 40)
+        for bar_num, cases in all_cases.items():
+            print(f"   {bar_num}: {len(cases)} cases")
+        print(f"📈 Total unique cases: {len(all_unique_cases)}")
+        print("=" * 40)
+        
+        if not all_unique_cases:
+            print("❌ No cases found for any bar numbers. Exiting.")
+            return
         
         # Now visit each case page and extract detailed information
-        print("\nExtracting detailed case information...")
-        progress_bar = tqdm(list(all_unique_cases), desc="Processing cases", unit="case")
+        print(f"\n📋 EXTRACTING DETAILED CASE INFORMATION")
+        print(f"🔍 Processing {len(all_unique_cases)} unique cases...")
+        progress_bar = tqdm(list(all_unique_cases), desc="🔍 Processing cases", unit="case")
         
         for case_number in progress_bar:
             progress_bar.set_description(f"Processing {case_number}")
@@ -429,48 +536,57 @@ def scrape_attorney_cases():
         progress_bar.close()
         
         # Save results
-        print(f"\nSaving results to {output_folder}")
+        print(f"\n💾 SAVING RESULTS")
+        print("=" * 40)
+        print(f"📁 Output folder: {output_folder}")
         
         # Save summary by bar number
         summary_file = os.path.join(output_folder, "cases_by_bar_number.json")
         with open(summary_file, 'w') as f:
             json.dump(all_cases, f, indent=2)
+        print(f"✅ Saved: cases_by_bar_number.json")
         
         # Save detailed case information
         details_file = os.path.join(output_folder, "case_details.json")
         with open(details_file, 'w') as f:
             json.dump(all_case_details, f, indent=2)
+        print(f"✅ Saved: case_details.json")
         
         # Create summary report
         report_file = os.path.join(output_folder, "summary_report.txt")
+        total_docs = sum(len(case['documents']) for case in all_case_details)
+        
         with open(report_file, 'w') as f:
             f.write(f"Attorney Case Search Report\n")
             f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
             
             f.write(f"Bar Numbers Searched: {', '.join(BAR_NUMBERS)}\n")
-            f.write(f"Courts Searched: {len(COURT_CODES)}\n\n")
+            f.write("Courts Searched: All 17 Texas courts (15 Courts of Appeals + Supreme Court + Court of Criminal Appeals)\n\n")
             
             f.write("Cases by Bar Number:\n")
-            total_docs = 0
             for bar_num, cases in all_cases.items():
                 f.write(f"  {bar_num}: {len(cases)} cases\n")
             
             f.write(f"\nTotal Unique Cases: {len(all_unique_cases)}\n")
-            
-            # Count total documents
-            for case in all_case_details:
-                total_docs += len(case['documents'])
-            
             f.write(f"Total Documents Found: {total_docs}\n")
         
-        print(f"Search complete! Found {len(all_unique_cases)} unique cases with {total_docs} documents.")
-        print(f"Results saved to: {output_folder}")
+        print(f"✅ Saved: summary_report.txt")
+        print("=" * 40)
+        
+        print(f"\n🎉 SCRAPING COMPLETE!")
+        print("=" * 60)
+        print(f"📈 Results Summary:")
+        print(f"   • {len(all_unique_cases)} unique cases found")
+        print(f"   • {total_docs} documents extracted")
+        print(f"   • Results saved to: {output_folder}")
+        print("=" * 60)
         
     except Exception as e:
-        print(f"Error during scraping: {str(e)}")
+        print(f"❌ Error during scraping: {str(e)}")
     finally:
-        print("Closing browser...")
+        print("🌐 Closing browser...")
         driver.quit()
+        print("✅ Browser closed")
 
 if __name__ == "__main__":
     scrape_attorney_cases() 

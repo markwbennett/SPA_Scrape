@@ -4,11 +4,11 @@ A Python project for searching Texas Court of Appeals cases by attorney bar numb
 
 ## Features
 
-- Searches for cases by specific attorney bar numbers across all Texas courts
+- Searches for cases by specific attorney bar numbers across all Texas courts using the "All Courts" option
 - Excludes inactive cases (searches only active cases)
 - Extracts detailed case information including parties and attorneys
 - Extracts document links with metadata from both events and briefs tables
-- Handles pagination automatically across multiple courts
+- Handles pagination automatically
 - Outputs structured data in JSON format
 - Generates comprehensive summary reports
 
@@ -21,9 +21,10 @@ The script is currently configured to search for these bar numbers:
 
 ## Courts Searched
 
-The script searches across all Texas Court of Appeals:
-- 1st through 14th Courts of Appeals
-- Texas Supreme Court
+The script searches across all Texas courts:
+- 1st through 15th Courts of Appeals
+- Texas Supreme Court (SCOTX)
+- Texas Court of Criminal Appeals (CCA)
 
 ## Setup
 
@@ -46,10 +47,10 @@ python COA_Scrape.py
 ```
 
 The script will:
-- Automatically search each court for cases where the specified bar numbers are counsel
+- Automatically search all 17 Texas courts at once for cases where the specified bar numbers are counsel
 - Filter to only active cases (excluding inactive cases)
 - Extract case details including parties, attorneys, and documents
-- Process all pages of results for each court
+- Process all pages of results
 - Save comprehensive results to timestamped output folder
 
 ## Output
