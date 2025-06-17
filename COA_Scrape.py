@@ -991,8 +991,146 @@ def generate_pdf_report(all_case_details, output_folder):
     print(f"✅ Generated PDF report: {pdf_file}")
     return pdf_file
 
+def analyze_briefs_with_claude(brief_paths_and_descriptions, case_number):
+    """Analyze multiple legal brief PDFs with Claude to extract legal issues"""
+    try:
+        # Get API key from environment variable
+        api_key = os.getenv('ANTHROPIC_API_KEY')
+        if not api_key:
+            print("❌ ANTHROPIC_API_KEY not found in .env file")
+            return []
+        
+        client = anthropic.Anthropic(api_key=api_key)
+        
+        # Prepare content array with all briefs
+        content = []
+        brief_descriptions = []
+        
+        # Read all PDF files and add them to content
+        import base64
+        for brief_path, brief_description in brief_paths_and_descriptions:
+            try:
+                with open(brief_path, 'rb') as f:
+                    pdf_content = base64.b64encode(f.read()).decode('utf-8')
+                
+                content.append({
+                    "type": "document",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "application/pdf",
+                        "data": pdf_content
+                    }
+                })
+                brief_descriptions.append(brief_description)
+            except Exception as e:
+                print(f"    ⚠️  Error reading {brief_path}: {e}")
+                continue
+        
+        if not content:
+            print(f"    ⚠️  No valid briefs to analyze for {case_number}")
+            return []
+        
+        # Create the analysis prompt
+        brief_list = "\n".join([f"- {desc}" for desc in brief_descriptions])
+        
+        content.append({
+            "type": "text",
+            "text": f"""You are a legal expert analyzing criminal appellate briefs from Texas courts. Please analyze ALL the briefs provided for case {case_number} and identify the distinct legal issues raised across all briefs.
+
+The briefs included are:
+{brief_list}
+
+For each legal issue, provide:
+1. A concise description of the issue (1-2 sentences)
+2. The specific legal area (e.g., "Fourth Amendment Search and Seizure", "Ineffective Assistance of Counsel", "Sufficiency of Evidence", etc.)
+3. Which brief(s) raised this issue
+
+Focus on substantive legal arguments, not procedural matters. Consolidate similar issues from different briefs. Return your analysis in JSON format with an array of issues:
+
+{{
+  "issues": [
+    {{
+      "description": "Brief description of the legal issue",
+      "legal_area": "Specific area of law",
+      "source_briefs": ["brief description 1", "brief description 2"]
+    }}
+  ]
+}}"""
+        })
+        
+        # Create message with all PDF attachments
+        message = client.messages.create(
+            model="claude-3-5-sonnet-20241022",
+            max_tokens=4000,
+            messages=[
+                {
+                    "role": "user",
+                    "content": content
+                }
+            ]
+        )
+        
+        response_text = message.content[0].text
+        
+        # Try to parse JSON response
+        try:
+            import json
+            import re
+            
+            # First try to find JSON in markdown code blocks
+            if "```json" in response_text:
+                json_start = response_text.find("```json") + 7
+                json_end = response_text.find("```", json_start)
+                if json_end != -1:
+                    response_text = response_text[json_start:json_end].strip()
+            elif "```" in response_text:
+                json_start = response_text.find("```") + 3
+                json_end = response_text.rfind("```")
+                if json_end != -1:
+                    response_text = response_text[json_start:json_end].strip()
+            
+            # If no markdown blocks, try to extract JSON using regex
+            if not response_text.strip().startswith('{'):
+                json_match = re.search(r'\{.*?\}', response_text, re.DOTALL)
+                if json_match:
+                    response_text = json_match.group(0)
+            
+            # Clean up the JSON text
+            response_text = response_text.strip()
+            
+            # Try parsing the JSON
+            result = json.loads(response_text)
+            return result.get('issues', [])
+            
+        except json.JSONDecodeError as e:
+            print(f"    ⚠️  Error parsing Claude response for {case_number}: {str(e)}")
+            print(f"    Response was: {response_text[:500]}...")
+            
+            # Try a more aggressive approach - look for the issues array specifically
+            try:
+                issues_match = re.search(r'"issues"\s*:\s*\[(.*?)\]', response_text, re.DOTALL)
+                if issues_match:
+                    issues_json = '{"issues":[' + issues_match.group(1) + ']}'
+                    result = json.loads(issues_json)
+                    return result.get('issues', [])
+            except:
+                pass
+            
+            return []
+            
+    except Exception as e:
+        error_msg = str(e)
+        print(f"    ⚠️  Error analyzing briefs with Claude for {case_number}: {error_msg}")
+        
+        # Check if it's a size limit error
+        if "too large" in error_msg.lower() or "limit" in error_msg.lower() or "size" in error_msg.lower():
+            print(f"    🔄 Input too large, falling back to individual brief analysis...")
+            return None  # Signal to fallback to individual processing
+        
+        return []
+
 def analyze_brief_with_claude(brief_path, case_number, brief_description):
-    """Analyze a legal brief PDF with Claude to extract legal issues"""
+    """Analyze a single legal brief PDF with Claude to extract legal issues"""
     try:
         # Get API key from environment variable
         api_key = os.getenv('ANTHROPIC_API_KEY')
@@ -1080,8 +1218,8 @@ Focus on substantive legal arguments, not procedural matters. Return your analys
             return result.get('issues', [])
             
         except json.JSONDecodeError as e:
-            print(f"Error parsing Claude response for {case_number}: {str(e)}")
-            print(f"Response was: {response_text[:500]}...")
+            print(f"    ⚠️  Error parsing Claude response for {case_number}: {str(e)}")
+            print(f"    Response was: {response_text[:500]}...")
             
             # Try a more aggressive approach - look for the issues array specifically
             try:
@@ -1096,7 +1234,7 @@ Focus on substantive legal arguments, not procedural matters. Return your analys
             return []
             
     except Exception as e:
-        print(f"Error analyzing brief with Claude for {case_number}: {str(e)}")
+        print(f"    ⚠️  Error analyzing brief with Claude for {case_number}: {str(e)}")
         return []
 
 def analyze_case_briefs(case_details, output_folder):
@@ -1111,8 +1249,8 @@ def analyze_case_briefs(case_details, output_folder):
     
     print(f"🔍 Analyzing {len(briefs_downloaded)} briefs for {case_number}")
     
-    all_issues = []
-    
+    # Prepare list of valid briefs for analysis
+    valid_briefs = []
     for brief in briefs_downloaded:
         # Handle both 'filepath' and 'file_path' keys for compatibility
         brief_path = brief.get('filepath') or brief.get('file_path')
@@ -1122,14 +1260,48 @@ def analyze_case_briefs(case_details, output_folder):
             print(f"    ⚠️  No file path found in brief data: {brief}")
             continue
         
-        print(f"  📄 Analyzing: {brief_description}")
-        
         # Check if file exists
         if not os.path.exists(brief_path):
             print(f"    ⚠️  File not found: {brief_path}")
             continue
         
-        # Analyze with Claude (sending PDF directly)
+        valid_briefs.append((brief_path, brief_description))
+    
+    if not valid_briefs:
+        print(f"    ⚠️  No valid briefs found for {case_number}")
+        case_details['legal_issues'] = []
+        return
+    
+    all_issues = []
+    
+    # Try to analyze all briefs together first
+    if len(valid_briefs) > 1:
+        print(f"  📄 Analyzing all {len(valid_briefs)} briefs together...")
+        issues = analyze_briefs_with_claude(valid_briefs, case_number)
+        
+        if issues is None:
+            # Size limit error - fall back to individual analysis
+            print(f"  🔄 Falling back to individual brief analysis...")
+            for brief_path, brief_description in valid_briefs:
+                print(f"    📄 Analyzing: {brief_description}")
+                individual_issues = analyze_brief_with_claude(brief_path, case_number, brief_description)
+                
+                if individual_issues:
+                    print(f"      ✅ Found {len(individual_issues)} legal issues")
+                    for issue in individual_issues:
+                        issue['source_brief'] = brief_description
+                        all_issues.append(issue)
+                else:
+                    print(f"      ⚠️  No legal issues identified")
+        elif issues:
+            print(f"    ✅ Found {len(issues)} legal issues from combined analysis")
+            all_issues.extend(issues)
+        else:
+            print(f"    ⚠️  No legal issues identified from combined analysis")
+    else:
+        # Only one brief - analyze individually
+        brief_path, brief_description = valid_briefs[0]
+        print(f"  📄 Analyzing single brief: {brief_description}")
         issues = analyze_brief_with_claude(brief_path, case_number, brief_description)
         
         if issues:
@@ -1140,7 +1312,7 @@ def analyze_case_briefs(case_details, output_folder):
         else:
             print(f"    ⚠️  No legal issues identified")
     
-    # Remove duplicate issues
+    # Remove duplicate issues (for fallback individual analysis)
     unique_issues = []
     seen_descriptions = set()
     
@@ -1259,8 +1431,16 @@ def generate_comprehensive_case_report(coa_cases_with_briefs, output_folder):
                 
                 for j, issue in enumerate(legal_issues, 1):
                     issue_text = f"{j}. <b>{issue.get('legal_area', 'General')}:</b> {issue.get('description', 'No description')}"
-                    if issue.get('source_brief'):
+                    
+                    # Handle both single source_brief and multiple source_briefs
+                    if issue.get('source_briefs'):
+                        # Multiple briefs from combined analysis
+                        source_text = ', '.join(issue['source_briefs'])
+                        issue_text += f" <i>(Sources: {source_text})</i>"
+                    elif issue.get('source_brief'):
+                        # Single brief from individual analysis
                         issue_text += f" <i>(Source: {issue['source_brief']})</i>"
+                    
                     story.append(Paragraph(issue_text, issue_style))
             else:
                 story.append(Paragraph("<b>Legal Issues:</b> No issues identified by analysis", defendant_style))
