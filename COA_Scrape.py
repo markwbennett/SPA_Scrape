@@ -1221,6 +1221,16 @@ Focus on substantive legal arguments, not procedural matters. Consolidate simila
         error_msg = str(e)
         print(f"    ⚠️  Error analyzing briefs with Claude for {case_number}: {error_msg}")
         
+        # Check if it's a rate limit error
+        if "429" in error_msg or "rate_limit_error" in error_msg.lower() or "rate limit" in error_msg.lower():
+            print(f"    🛑 Rate limit exceeded for {case_number}. Backing off...")
+            import time
+            # Wait 60 seconds before retrying
+            print(f"    ⏰ Waiting 60 seconds before continuing...")
+            time.sleep(60)
+            print(f"    🔄 Resuming analysis after rate limit backoff...")
+            return None  # Signal to retry or skip for now
+        
         # Check if it's a size limit error (various error messages)
         size_limit_keywords = ["too large", "limit", "size", "100 pdf pages", "maximum", "exceeded"]
         if any(keyword in error_msg.lower() for keyword in size_limit_keywords):
@@ -1291,7 +1301,19 @@ Focus on substantive legal arguments, not procedural matters. Return your analys
         return parse_claude_json_response(response_text, case_number)
             
     except Exception as e:
-        print(f"    ⚠️  Error analyzing brief with Claude for {case_number}: {str(e)}")
+        error_msg = str(e)
+        print(f"    ⚠️  Error analyzing brief with Claude for {case_number}: {error_msg}")
+        
+        # Check if it's a rate limit error
+        if "429" in error_msg or "rate_limit_error" in error_msg.lower() or "rate limit" in error_msg.lower():
+            print(f"    🛑 Rate limit exceeded for {case_number}. Backing off...")
+            import time
+            # Wait 60 seconds before retrying
+            print(f"    ⏰ Waiting 60 seconds before continuing...")
+            time.sleep(60)
+            print(f"    🔄 Resuming analysis after rate limit backoff...")
+            return None  # Signal to retry or skip for now
+        
         return []
 
 def analyze_case_briefs(case_details, output_folder):
@@ -1355,34 +1377,53 @@ def analyze_case_briefs(case_details, output_folder):
         for desc in batch_descriptions:
             print(f"      - {desc}")
     
-    # Analyze each batch
-    for i, batch in enumerate(batches, 1):
+    # Analyze each batch with rate limit handling
+    batch_index = 0
+    while batch_index < len(batches):
+        batch = batches[batch_index]
         batch_briefs = [(path, desc) for path, desc, _ in batch]
         batch_pages = sum(pages for _, _, pages in batch)
         
-        print(f"  🔍 Analyzing batch {i}/{len(batches)} ({len(batch_briefs)} brief(s), {batch_pages} pages)...")
+        print(f"  🔍 Analyzing batch {batch_index + 1}/{len(batches)} ({len(batch_briefs)} brief(s), {batch_pages} pages)...")
         
         if len(batch_briefs) > 1:
             # Multiple briefs in batch - analyze together
             issues = analyze_briefs_with_claude(batch_briefs, case_number)
             
-            if issues:
-                print(f"    ✅ Found {len(issues)} legal issues from batch {i}")
+            if issues is None:
+                # Rate limit or other error that requires retry - don't advance batch_index
+                print(f"    🔄 Retrying batch {batch_index + 1} after backoff...")
+                continue
+            elif issues:
+                print(f"    ✅ Found {len(issues)} legal issues from batch {batch_index + 1}")
                 all_issues.extend(issues)
             else:
-                print(f"    ⚠️  No issues found from batch {i}")
+                print(f"    ⚠️  No issues found from batch {batch_index + 1}")
         else:
             # Single brief in batch
             brief_path, brief_description = batch_briefs[0]
             issues = analyze_brief_with_claude(brief_path, case_number, brief_description)
             
-            if issues:
+            if issues is None:
+                # Rate limit or other error that requires retry - don't advance batch_index
+                print(f"    🔄 Retrying batch {batch_index + 1} after backoff...")
+                continue
+            elif issues:
                 print(f"    ✅ Found {len(issues)} legal issues from {brief_description}")
                 for issue in issues:
                     issue['source_brief'] = brief_description
                     all_issues.append(issue)
             else:
                 print(f"    ⚠️  No issues found from {brief_description}")
+        
+        # Move to next batch only if current batch completed successfully
+        batch_index += 1
+        
+        # Add a small delay between batches to help prevent rate limiting
+        if batch_index < len(batches):
+            import time
+            print(f"    ⏸️  Pausing 2 seconds before next batch...")
+            time.sleep(2)
     
     # Remove duplicate issues (for fallback individual analysis)
     unique_issues = []
