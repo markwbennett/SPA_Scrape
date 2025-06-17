@@ -1100,7 +1100,7 @@ def count_pdf_pages(pdf_path):
             print(f"    ⚠️  Could not count pages for {pdf_path}, assuming 10 pages")
             return 10  # Conservative fallback
 
-def extract_pdf_text(pdf_path, max_pages=100):
+def extract_pdf_text(pdf_path, max_pages=30):
     """Extract text from PDF file, limiting to max_pages"""
     try:
         import PyPDF2
@@ -1354,6 +1354,31 @@ Focus on substantive legal arguments, not procedural matters. Consolidate simila
         
         return []
 
+def estimate_tokens(text):
+    """Rough token estimation: ~1.3 tokens per word"""
+    words = len(text.split())
+    return int(words * 1.3)
+
+def truncate_text_to_tokens(text, max_tokens=40000):
+    """Truncate text to stay within token limit"""
+    estimated_tokens = estimate_tokens(text)
+    
+    if estimated_tokens <= max_tokens:
+        return text
+    
+    # Calculate how much text to keep (with safety margin)
+    ratio = (max_tokens * 0.9) / estimated_tokens  # 90% of limit for safety
+    char_limit = int(len(text) * ratio)
+    
+    # Truncate at word boundary
+    truncated = text[:char_limit]
+    last_space = truncated.rfind(' ')
+    if last_space > 0:
+        truncated = truncated[:last_space]
+    
+    print(f"    ✂️  Truncated text from ~{estimated_tokens} to ~{estimate_tokens(truncated)} tokens")
+    return truncated
+
 def analyze_brief_text_with_claude(text_content, case_number, brief_description):
     """Analyze extracted text from a legal brief with Claude"""
     try:
@@ -1365,6 +1390,9 @@ def analyze_brief_text_with_claude(text_content, case_number, brief_description)
         
         client = anthropic.Anthropic(api_key=api_key)
         
+        # Truncate text to fit within token limits
+        truncated_text = truncate_text_to_tokens(text_content, max_tokens=40000)
+        
         # Create message with text content
         message = client.messages.create(
             model="claude-3-5-sonnet-20241022",
@@ -1375,7 +1403,7 @@ def analyze_brief_text_with_claude(text_content, case_number, brief_description)
                     "content": f"""You are a legal expert analyzing a criminal appellate brief from Texas courts. Please analyze this brief text from case {case_number} ({brief_description}) and identify the distinct legal issues raised.
 
 BRIEF TEXT:
-{text_content[:50000]}  
+{truncated_text}  
 
 For each legal issue, provide:
 1. A concise description of the issue (1-2 sentences)
@@ -1435,7 +1463,7 @@ def analyze_brief_with_claude(brief_path, case_number, brief_description):
             if pdf_content is None:
                 # Fallback to text extraction if truncation fails
                 print(f"    🔄 PDF truncation failed, extracting text instead...")
-                text_content = extract_pdf_text(brief_path, 100)
+                text_content = extract_pdf_text(brief_path, 30)
                 if text_content:
                     return analyze_brief_text_with_claude(text_content, case_number, brief_description)
                 else:
@@ -1509,7 +1537,7 @@ Focus on substantive legal arguments, not procedural matters. Return your analys
         # Check if it's a PDF processing error - fallback to text extraction
         if "could not process pdf" in error_msg.lower() or ("pdf" in error_msg.lower() and "process" in error_msg.lower()):
             print(f"    🔄 PDF processing failed, extracting text instead...")
-            text_content = extract_pdf_text(brief_path, 100)
+            text_content = extract_pdf_text(brief_path, 30)
             if text_content:
                 return analyze_brief_text_with_claude(text_content, case_number, brief_description)
             else:
