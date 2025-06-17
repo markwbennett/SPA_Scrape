@@ -9,9 +9,10 @@ import os
 import time
 import logging
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, List, Any, Optional
 import re
+from urllib.parse import urljoin
 
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -29,6 +30,7 @@ from reportlab.lib.units import inch
 from reportlab.lib import colors
 import anthropic
 from dotenv import load_dotenv
+import argparse
 
 # Load environment variables
 load_dotenv()
@@ -194,10 +196,19 @@ def names_match(name1, name2):
 # Base directory for output files
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# Bar numbers to search for (testing adaptations)
+# Bar numbers to search for
 BAR_NUMBERS = [
-    "24032600"
+    "24032600",
+    "24053705", 
+    "24031632"
 ]
+
+# SPA Lawyer mapping
+SPA_LAWYERS = {
+    "24031632": "Stacy Soule",
+    "24053705": "John Messinger", 
+    "24032600": "Emily Johnson-Liu"
+}
 
 # Use "All Courts" option to search all 17 Texas courts at once
 # (15 Courts of Appeals + Supreme Court + Court of Criminal Appeals)
@@ -980,8 +991,6 @@ def generate_pdf_report(all_case_details, output_folder):
     print(f"✅ Generated PDF report: {pdf_file}")
     return pdf_file
 
-
-
 def analyze_brief_with_claude(brief_path, case_number, brief_description):
     """Analyze a legal brief PDF with Claude to extract legal issues"""
     try:
@@ -1043,22 +1052,47 @@ Focus on substantive legal arguments, not procedural matters. Return your analys
         # Try to parse JSON response
         try:
             import json
-            # Extract JSON from response if it's wrapped in markdown
+            import re
+            
+            # First try to find JSON in markdown code blocks
             if "```json" in response_text:
                 json_start = response_text.find("```json") + 7
                 json_end = response_text.find("```", json_start)
-                response_text = response_text[json_start:json_end].strip()
+                if json_end != -1:
+                    response_text = response_text[json_start:json_end].strip()
             elif "```" in response_text:
                 json_start = response_text.find("```") + 3
                 json_end = response_text.rfind("```")
-                response_text = response_text[json_start:json_end].strip()
+                if json_end != -1:
+                    response_text = response_text[json_start:json_end].strip()
             
+            # If no markdown blocks, try to extract JSON using regex
+            if not response_text.strip().startswith('{'):
+                json_match = re.search(r'\{.*?\}', response_text, re.DOTALL)
+                if json_match:
+                    response_text = json_match.group(0)
+            
+            # Clean up the JSON text
+            response_text = response_text.strip()
+            
+            # Try parsing the JSON
             result = json.loads(response_text)
             return result.get('issues', [])
             
         except json.JSONDecodeError as e:
             print(f"Error parsing Claude response for {case_number}: {str(e)}")
             print(f"Response was: {response_text[:500]}...")
+            
+            # Try a more aggressive approach - look for the issues array specifically
+            try:
+                issues_match = re.search(r'"issues"\s*:\s*\[(.*?)\]', response_text, re.DOTALL)
+                if issues_match:
+                    issues_json = '{"issues":[' + issues_match.group(1) + ']}'
+                    result = json.loads(issues_json)
+                    return result.get('issues', [])
+            except:
+                pass
+            
             return []
             
     except Exception as e:
@@ -1080,8 +1114,13 @@ def analyze_case_briefs(case_details, output_folder):
     all_issues = []
     
     for brief in briefs_downloaded:
-        brief_path = brief['filepath']
+        # Handle both 'filepath' and 'file_path' keys for compatibility
+        brief_path = brief.get('filepath') or brief.get('file_path')
         brief_description = brief['description']
+        
+        if not brief_path:
+            print(f"    ⚠️  No file path found in brief data: {brief}")
+            continue
         
         print(f"  📄 Analyzing: {brief_description}")
         
@@ -1202,6 +1241,12 @@ def generate_comprehensive_case_report(coa_cases_with_briefs, output_folder):
         story.append(Paragraph(f"<b>Defendant:</b> {defendant_name}", defendant_style))
         story.append(Paragraph(f"<b>Defense Counsel:</b> {defense_counsel}", defendant_style))
         
+        # SPA Lawyer information
+        spa_lawyers = case.get('spa_lawyers', [])
+        if spa_lawyers:
+            spa_lawyer_text = ', '.join(spa_lawyers)
+            story.append(Paragraph(f"<b>SPA Lawyer:</b> {spa_lawyer_text}", defendant_style))
+        
         # Briefs status
         briefs_downloaded = case.get('briefs_downloaded', [])
         if briefs_downloaded:
@@ -1234,341 +1279,572 @@ def generate_comprehensive_case_report(coa_cases_with_briefs, output_folder):
     print(f"✅ Generated comprehensive case report: {pdf_file}")
     return pdf_file
 
-def scrape_attorney_cases():
+def load_existing_case_data(output_folder):
+    """Load existing case data from JSON files if they exist"""
+    details_file = os.path.join(output_folder, "case_details.json")
+    existing_cases = {}
+    
+    if os.path.exists(details_file):
+        try:
+            with open(details_file, 'r') as f:
+                case_details_list = json.load(f)
+                # Convert list to dict keyed by case number for easy lookup
+                for case in case_details_list:
+                    existing_cases[case['case_number']] = case
+            print(f"📂 Loaded {len(existing_cases)} existing cases from {details_file}")
+        except Exception as e:
+            print(f"⚠️  Error loading existing case data: {e}")
+    
+    return existing_cases
+
+def case_needs_processing(case_number, existing_cases):
+    """Check if a case needs processing or if it's already complete"""
+    if case_number not in existing_cases:
+        return True, "New case"
+    
+    existing_case = existing_cases[case_number]
+    
+    # Check if case was filtered out
+    if existing_case.get('filtered_out', False):
+        return False, f"Already filtered: {existing_case.get('filter_reason', 'Unknown')}"
+    
+    # Check if briefs were already downloaded
+    briefs_downloaded = existing_case.get('briefs_downloaded', [])
+    if briefs_downloaded:
+        # Check if legal issues were already analyzed
+        legal_issues = existing_case.get('legal_issues', [])
+        if legal_issues:
+            return False, f"Complete: {len(briefs_downloaded)} briefs, {len(legal_issues)} issues"
+        else:
+            return True, f"Needs analysis: {len(briefs_downloaded)} briefs downloaded"
+    
+    return True, "Needs brief download"
+
+def briefs_already_downloaded(case_number, output_folder):
+    """Check if briefs for this case are already downloaded"""
+    briefs_folder = os.path.join(output_folder, "briefs")
+    if not os.path.exists(briefs_folder):
+        return False, []
+    
+    # Look for files that start with the case number
+    downloaded_briefs = []
+    for filename in os.listdir(briefs_folder):
+        if filename.startswith(case_number) and filename.endswith('.pdf'):
+            downloaded_briefs.append(filename)
+    
+    return len(downloaded_briefs) > 0, downloaded_briefs
+
+def scrape_attorney_cases(analysis_only=False):
     """Main function to scrape cases for specific attorney bar numbers"""
     print("🚀 Starting Texas Court of Appeals Case Scraper")
+    if analysis_only:
+        print("🔬 ANALYSIS-ONLY MODE: Skipping search and brief download")
     print("=" * 60)
     
     # Create data output folder (overwrite previous versions)
     output_folder = os.path.join(BASE_DIR, "data")
     os.makedirs(output_folder, exist_ok=True)
     
+    # Load existing case data
+    existing_cases = load_existing_case_data(output_folder)
+    
     print(f"📁 Output folder: {output_folder}")
-    print(f"🎯 Target bar numbers: {', '.join(BAR_NUMBERS)}")
-    print("🏛️ Searching across all 17 Texas courts:")
-    print("   • 15 Courts of Appeals (1st-15th)")
-    print("   • Supreme Court of Texas (SCOTX)")
-    print("   • Court of Criminal Appeals (CCA)")
-    print("🚫 Excluding inactive cases")
+    if not analysis_only:
+        print(f"🎯 Target bar numbers: {', '.join(BAR_NUMBERS)}")
+        print("🏛️ Searching across all 17 Texas courts:")
+        print("   • 15 Courts of Appeals (1st-15th)")
+        print("   • Supreme Court of Texas (SCOTX)")
+        print("   • Court of Criminal Appeals (CCA)")
+        print("🚫 Excluding inactive cases")
     print("=" * 60)
     
     # Start browser
-    print("🌐 Starting Chrome browser (headless mode)...")
-    driver = setup_browser(headless=True)
-    print("✅ Browser started successfully")
+    if not analysis_only:
+        print("🌐 Starting Chrome browser (headless mode)...")
+        driver = setup_browser(headless=True)
+        print("✅ Browser started successfully")
+    else:
+        driver = None
     
     all_cases = {}
     all_case_details = []
     
     try:
-        # PHASE 1: Search all courts for each bar number
-        print("\n" + "="*60)
-        print("📋 PHASE 1: COLLECTING CASE DATA")
-        print("="*60)
-        
-        for i, bar_number in enumerate(BAR_NUMBERS, 1):
-            print(f"\n{'='*20} BAR NUMBER {i}/{len(BAR_NUMBERS)} {'='*20}")
-            print(f"🎯 Target: {bar_number}")
+        if analysis_only:
+            # ANALYSIS-ONLY MODE: Load existing cases and jump to Claude analysis
+            print("\n" + "="*60)
+            print("🔬 ANALYSIS-ONLY MODE: LOADING EXISTING CASES")
+            print("="*60)
             
-            try:
-                cases = search_by_attorney_bar_number(driver, bar_number)
-                all_cases[bar_number] = cases
-                print(f"✅ Search complete: Found {len(cases)} cases for {bar_number}")
-            except Exception as e:
-                print(f"❌ Error searching for bar number {bar_number}: {str(e)}")
-                all_cases[bar_number] = []
-                continue
-        
-        # Get all unique case numbers across all bar numbers
-        all_unique_cases = set()
-        for cases in all_cases.values():
-            all_unique_cases.update(cases)
-        
-        print(f"\n📊 SEARCH SUMMARY")
-        print("=" * 40)
-        for bar_num, cases in all_cases.items():
-            print(f"   {bar_num}: {len(cases)} cases")
-        print(f"📈 Total unique cases: {len(all_unique_cases)}")
-        print("=" * 40)
-        
-        if not all_unique_cases:
-            print("❌ No cases found for any bar numbers. Exiting.")
-            return
-        
-        # Extract detailed information for all cases (without downloading briefs)
-        print(f"\n🔍 Processing {len(all_unique_cases)} unique cases...")
-        progress_bar = tqdm(list(all_unique_cases), desc="🔍 Processing cases", unit="case")
-        
-        for case_number in progress_bar:
-            progress_bar.set_description(f"Processing {case_number}")
+            if not existing_cases:
+                print("❌ No existing cases found. Run without --analysis-only first to collect cases.")
+                return
             
-            try:
-                # Navigate to case page
-                url = f"https://search.txcourts.gov/Case.aspx?cn={case_number}"
-                driver.get(url)
+            # Load all existing cases
+            all_case_details = list(existing_cases.values())
+            print(f"📂 Loaded {len(all_case_details)} existing cases")
+            
+            # Jump directly to Claude analysis phase
+            print("\n" + "="*60)
+            print("🔬 CLAUDE ANALYSIS PHASE")
+            print("="*60)
+            
+            # Run Claude analysis
+            eligible_coa_cases = run_claude_analysis(all_case_details, output_folder, analysis_only=True)
+            
+            # Save results
+            print(f"\n💾 SAVING RESULTS")
+            print("=" * 40)
+            print(f"📁 Output folder: {output_folder}")
+            
+            # Save summary by bar number
+            summary_file = os.path.join(output_folder, "cases_by_bar_number.json")
+            with open(summary_file, 'w') as f:
+                json.dump(all_cases, f, indent=2)
+            print(f"✅ Saved: cases_by_bar_number.json")
+            
+            # Save detailed case information
+            details_file = os.path.join(output_folder, "case_details.json")
+            with open(details_file, 'w') as f:
+                json.dump(all_case_details, f, indent=2)
+            print(f"✅ Saved: case_details.json")
+            
+            # Create summary report
+            report_file = os.path.join(output_folder, "summary_report.txt")
+            total_docs = sum(len(case['documents']) for case in all_case_details if not case.get('filtered_out', False))
+            total_calendar_events = sum(len(case['calendar_events']) for case in all_case_details if not case.get('filtered_out', False))
+            total_briefs = sum(len(case.get('briefs_downloaded', [])) for case in all_case_details)
+            total_legal_issues = sum(len(case.get('legal_issues', [])) for case in all_case_details)
+            filtered_cases = sum(1 for case in all_case_details if case.get('filtered_out', False))
+            active_cases = len(all_case_details) - filtered_cases
+            
+            with open(report_file, 'w') as f:
+                f.write(f"Attorney Case Search Report\n")
+                f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
                 
-                # Wait for page to load
-                WebDriverWait(driver, 30).until(
-                    EC.any_of(
-                        EC.presence_of_element_located((By.ID, "ctl00_ContentPlaceHolder1_grdEvents_ctl00")),
-                        EC.presence_of_element_located((By.ID, "ctl00_ContentPlaceHolder1_grdBriefs_ctl00")),
-                        EC.presence_of_element_located((By.CLASS_NAME, "panel-content"))
-                    )
-                )
+                f.write(f"Bar Numbers Searched: {', '.join(BAR_NUMBERS)}\n")
+                f.write("Courts Searched: All 17 Texas courts (15 Courts of Appeals + Supreme Court + Court of Criminal Appeals)\n\n")
                 
-                # Parse page and extract details (WITHOUT downloading briefs)
-                soup = BeautifulSoup(driver.page_source, 'html.parser')
-                
-                case_details = extract_case_details(driver, soup, case_number, output_folder=None, all_case_numbers=all_unique_cases)
-                
-                # Add which bar numbers this case is associated with
-                case_details['associated_bar_numbers'] = []
+                f.write("Cases by Bar Number:\n")
                 for bar_num, cases in all_cases.items():
-                    if case_number in cases:
-                        case_details['associated_bar_numbers'].append(bar_num)
+                    f.write(f"  {bar_num}: {len(cases)} cases\n")
                 
-                all_case_details.append(case_details)
-                
-                # Update progress
-                doc_count = len(case_details['documents'])
-                progress_bar.set_postfix(docs=doc_count)
-                
-            except Exception as e:
-                progress_bar.write(f"Error processing {case_number}: {str(e)}")
-                continue
-        
-        progress_bar.close()
-        
-        # PHASE 2: Analyze cases and download briefs for eligible COA cases
-        print("\n" + "="*60)
-        print("📋 PHASE 2: ANALYZING CASES AND DOWNLOADING BRIEFS")
-        print("="*60)
-        
-        # Separate COA and PD cases
-        coa_cases = [case for case in all_case_details if case.get('is_coa_case', False)]
-        pd_cases = [case for case in all_case_details if case['case_number'].startswith('PD-')]
-        
-        print(f"📊 Case breakdown:")
-        print(f"   • COA cases: {len(coa_cases)}")
-        print(f"   • PD cases: {len(pd_cases)}")
-        print(f"   • Other cases: {len(all_case_details) - len(coa_cases) - len(pd_cases)}")
-        
-        # Get all non-state parties from PD cases
-        pd_non_state_parties = []
-        for case in pd_cases:
-            if not case.get('filtered_out', False):  # Only active PD cases
-                for party in case.get('parties', []):
-                    if not party.get('is_state_party', False):
-                        pd_non_state_parties.append(party['name'])
-        
-        print(f"🔍 Found {len(pd_non_state_parties)} unique non-state parties in active PD cases")
-        
-        # Determine which COA cases should have briefs downloaded
-        eligible_coa_cases = []
-        for case in coa_cases:
-            # Check for non-state parties first
-            non_state_parties = [p for p in case.get('parties', []) if not p.get('is_state_party', False)]
-            if not non_state_parties:
-                case['brief_download_reason'] = "No non-state parties found"
-                case['filtered_out'] = True
-                case['filter_reason'] = 'No non-state parties'
-                continue
+                f.write(f"\nTotal Unique Cases Found: {len(all_unique_cases)}\n")
+                f.write(f"Active Cases (processed): {active_cases}\n")
+                f.write(f"Filtered Cases (mandate issued): {filtered_cases}\n")
+                f.write(f"COA Cases: {len(coa_cases)}\n")
+                f.write(f"PD Cases: {len(pd_cases)}\n")
+                f.write(f"Eligible COA Cases for Brief Download: {len(eligible_coa_cases)}\n")
+                f.write(f"Total Documents Found: {total_docs}\n")
+                f.write(f"Total Calendar Events Found: {total_calendar_events}\n")
+                f.write(f"Total Briefs Downloaded: {total_briefs}\n")
+                f.write(f"Total Legal Issues Identified: {total_legal_issues}\n")
             
-            # Check if any non-state parties have concurrent PD cases (BEFORE mandate check)
-            parties_with_pd_cases = []
-            for party in non_state_parties:
-                coa_party_name = party['name']
-                # Check if this COA party matches any PD party
-                for pd_party_name in pd_non_state_parties:
-                    if names_match(coa_party_name, pd_party_name):
-                        parties_with_pd_cases.append(f"{coa_party_name} (matches PD: {pd_party_name})")
-                        break  # Found a match, no need to check other PD parties
+            print(f"✅ Saved: summary_report.txt")
             
-            if parties_with_pd_cases:
-                case['brief_download_reason'] = f"Parties have concurrent PD cases: {', '.join(parties_with_pd_cases)}"
-                case['filtered_out'] = True
-                case['filter_reason'] = 'Concurrent PD cases'
-                continue
+            # Generate PDF report
+            print(f"\n📄 GENERATING PDF REPORT")
+            print("=" * 40)
+            generate_pdf_report(all_case_details, output_folder)
+            print("=" * 40)
             
-            # NOW check if mandate has been issued (after PD case check)
-            if case.get('mandate_issued', False):
-                case['brief_download_reason'] = "Mandate has been issued"
-                case['filtered_out'] = True
-                case['filter_reason'] = 'Mandate issued'
-                continue
+            print(f"\n🎉 SCRAPING COMPLETE!")
+            print("=" * 60)
+            print(f"📈 Results Summary:")
+            print(f"   • {len(all_unique_cases)} unique cases found")
+            print(f"   • {active_cases} active cases processed")
+            print(f"   • {filtered_cases} cases filtered (mandate issued)")
+            print(f"   • {len(coa_cases)} COA cases")
+            print(f"   • {len(pd_cases)} PD cases")
+            print(f"   • {len(eligible_coa_cases)} eligible COA cases for brief download")
+            print(f"   • {total_docs} documents extracted")
+            print(f"   • {total_calendar_events} calendar events extracted")
+            print(f"   • {total_briefs} briefs downloaded")
+            print(f"   • {total_legal_issues} legal issues identified")
+            print(f"   • Results saved to: {output_folder}")
+            print("=" * 60)
             
-            # This case is eligible for brief download
-            case['brief_download_reason'] = f"Eligible: COA case with {len(non_state_parties)} non-state parties, no concurrent PD cases, mandate not issued"
-            eligible_coa_cases.append(case)
-        
-        print(f"\n📥 BRIEF DOWNLOAD ANALYSIS:")
-        print(f"   • Eligible COA cases: {len(eligible_coa_cases)}")
-        print(f"   • Filtered COA cases: {len(coa_cases) - len(eligible_coa_cases)}")
-        
-        # Download briefs for eligible cases
-        if eligible_coa_cases:
-            print(f"\n🔄 Downloading briefs for {len(eligible_coa_cases)} eligible COA cases...")
-            brief_progress = tqdm(eligible_coa_cases, desc="📥 Downloading briefs", unit="case")
-            
-            for case in brief_progress:
-                case_number = case['case_number']
-                brief_progress.set_description(f"Downloading briefs for {case_number}")
-                
-                try:
-                    # Navigate to case page
-                    url = f"https://search.txcourts.gov/Case.aspx?cn={case_number}"
-                    driver.get(url)
-                    
-                    # Wait for page to load
-                    WebDriverWait(driver, 30).until(
-                        EC.any_of(
-                            EC.presence_of_element_located((By.ID, "ctl00_ContentPlaceHolder1_grdEvents_ctl00")),
-                            EC.presence_of_element_located((By.ID, "ctl00_ContentPlaceHolder1_grdBriefs_ctl00")),
-                            EC.presence_of_element_located((By.CLASS_NAME, "panel-content"))
-                        )
-                    )
-                    
-                    # Parse page and download briefs
-                    soup = BeautifulSoup(driver.page_source, 'html.parser')
-                    print(f"📥 Downloading briefs for {case_number}: {case['brief_download_reason']}")
-                    
-                    briefs_downloaded = download_briefs_for_case(driver, soup, case_number, output_folder)
-                    case['briefs_downloaded'] = briefs_downloaded
-                    
-                    brief_progress.set_postfix(briefs=len(briefs_downloaded))
-                    
-                except Exception as e:
-                    brief_progress.write(f"Error downloading briefs for {case_number}: {str(e)}")
-                    case['briefs_downloaded'] = []
-                    continue
-            
-            brief_progress.close()
-        
-        # PHASE 3: Analyze briefs with Claude and generate comprehensive report
-        print("\n" + "="*60)
-        print("📋 PHASE 3: ANALYZING BRIEFS WITH CLAUDE")
-        print("="*60)
-        
-        # Check if API key is available
-        api_key = os.getenv('ANTHROPIC_API_KEY')
-        if not api_key:
-            print("⚠️  ANTHROPIC_API_KEY environment variable not set")
-            print("⚠️  Skipping Claude analysis. Set the API key to enable brief analysis.")
-            print("⚠️  Export ANTHROPIC_API_KEY=your_api_key_here")
         else:
-            print(f"🤖 Analyzing briefs with Claude for {len(eligible_coa_cases)} cases...")
+            # NORMAL MODE: Search, collect, and download briefs
+            # PHASE 1: Search all courts for each bar number
+            print("\n" + "="*60)
+            print("📋 PHASE 1: COLLECTING CASE DATA")
+            print("="*60)
             
-            analysis_progress = tqdm(eligible_coa_cases, desc="🤖 Analyzing with Claude", unit="case")
-            
-            for case in analysis_progress:
-                case_number = case['case_number']
-                analysis_progress.set_description(f"Analyzing {case_number}")
+            for i, bar_number in enumerate(BAR_NUMBERS, 1):
+                print(f"\n{'='*20} BAR NUMBER {i}/{len(BAR_NUMBERS)} {'='*20}")
+                print(f"🎯 Target: {bar_number}")
                 
                 try:
-                    analyze_case_briefs(case, output_folder)
-                    
-                    # Update progress with issue count
-                    issue_count = len(case.get('legal_issues', []))
-                    analysis_progress.set_postfix(issues=issue_count)
-                    
+                    cases = search_by_attorney_bar_number(driver, bar_number)
+                    all_cases[bar_number] = cases
+                    print(f"✅ Search complete: Found {len(cases)} cases for {bar_number}")
                 except Exception as e:
-                    analysis_progress.write(f"Error analyzing briefs for {case_number}: {str(e)}")
-                    case['legal_issues'] = []
+                    print(f"❌ Error searching for bar number {bar_number}: {str(e)}")
+                    all_cases[bar_number] = []
                     continue
             
-            analysis_progress.close()
+            # Get all unique case numbers across all bar numbers
+            all_unique_cases = set()
+            for cases in all_cases.values():
+                all_unique_cases.update(cases)
             
-            # Generate comprehensive case report
-            print(f"\n📄 GENERATING COMPREHENSIVE CASE REPORT")
+            print(f"\n📊 SEARCH SUMMARY")
             print("=" * 40)
-            generate_comprehensive_case_report(eligible_coa_cases, output_folder)
+            for bar_num, cases in all_cases.items():
+                print(f"   {bar_num}: {len(cases)} cases")
+            print(f"📈 Total unique cases: {len(all_unique_cases)}")
             print("=" * 40)
+            
+            if not all_unique_cases:
+                print("❌ No cases found for any bar numbers. Exiting.")
+                return
+            
+            # Filter cases that need processing
+            cases_to_process = []
+            skipped_cases = []
+            
+            for case_number in all_unique_cases:
+                needs_processing, reason = case_needs_processing(case_number, existing_cases)
+                if needs_processing:
+                    cases_to_process.append(case_number)
+                else:
+                    skipped_cases.append((case_number, reason))
+            
+            print(f"\n📊 PROCESSING ANALYSIS:")
+            print(f"   • Cases to process: {len(cases_to_process)}")
+            print(f"   • Cases to skip: {len(skipped_cases)}")
+            
+            # Debug: Show which cases are being skipped and why
+            if skipped_cases:
+                print(f"\n🔍 DEBUG - Cases being skipped:")
+                for case_number, reason in skipped_cases:
+                    print(f"   • {case_number}: {reason}")
+            
+            # Add existing cases to all_case_details
+            for case_number, existing_case in existing_cases.items():
+                if case_number in all_unique_cases:
+                    # Set today's date for first_analyzed for all existing cases
+                    existing_case['first_analyzed'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    all_case_details.append(existing_case)
+            
+            # Extract detailed information for cases that need processing
+            if cases_to_process:
+                print(f"\n🔍 Processing {len(cases_to_process)} cases that need updates...")
+                progress_bar = tqdm(cases_to_process, desc="🔍 Processing cases", unit="case")
+                
+                for case_number in progress_bar:
+                    progress_bar.set_description(f"Processing {case_number}")
+                    
+                    try:
+                        # Navigate to case page
+                        url = f"https://search.txcourts.gov/Case.aspx?cn={case_number}"
+                        driver.get(url)
+                        
+                        # Wait for page to load
+                        WebDriverWait(driver, 30).until(
+                            EC.any_of(
+                                EC.presence_of_element_located((By.ID, "ctl00_ContentPlaceHolder1_grdEvents_ctl00")),
+                                EC.presence_of_element_located((By.ID, "ctl00_ContentPlaceHolder1_grdBriefs_ctl00")),
+                                EC.presence_of_element_located((By.CLASS_NAME, "panel-content"))
+                            )
+                        )
+                        
+                        # Parse page and extract details (WITHOUT downloading briefs)
+                        soup = BeautifulSoup(driver.page_source, 'html.parser')
+                        
+                        case_details = extract_case_details(driver, soup, case_number, output_folder=None, all_case_numbers=all_unique_cases)
+                        
+                        # Add which bar numbers this case is associated with and SPA lawyer
+                        case_details['associated_bar_numbers'] = []
+                        case_details['spa_lawyers'] = []
+                        for bar_num, cases in all_cases.items():
+                            if case_number in cases:
+                                case_details['associated_bar_numbers'].append(bar_num)
+                                if bar_num in SPA_LAWYERS:
+                                    case_details['spa_lawyers'].append(SPA_LAWYERS[bar_num])
+                        
+                        # Add first analyzed timestamp for new cases
+                        case_details['first_analyzed'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                        
+                        all_case_details.append(case_details)
+                        
+                        # Update progress
+                        doc_count = len(case_details['documents'])
+                        progress_bar.set_postfix(docs=doc_count)
+                        
+                    except Exception as e:
+                        progress_bar.write(f"Error processing {case_number}: {str(e)}")
+                        continue
+                
+                progress_bar.close()
+            else:
+                print("📭 No cases need processing - all cases are up to date")
+            
+            # PHASE 2: Analyze cases and download briefs for eligible COA cases
+            print("\n" + "="*60)
+            print("📋 PHASE 2: ANALYZING CASES AND DOWNLOADING BRIEFS")
+            print("="*60)
+            
+            # Separate COA and PD cases
+            coa_cases = [case for case in all_case_details if case.get('is_coa_case', False)]
+            pd_cases = [case for case in all_case_details if case['case_number'].startswith('PD-')]
+            
+            print(f"📊 Case breakdown:")
+            print(f"   • COA cases: {len(coa_cases)}")
+            print(f"   • PD cases: {len(pd_cases)}")
+            print(f"   • Other cases: {len(all_case_details) - len(coa_cases) - len(pd_cases)}")
+            
+            # Get all non-state parties from PD cases
+            pd_non_state_parties = []
+            for case in pd_cases:
+                if not case.get('filtered_out', False):  # Only active PD cases
+                    for party in case.get('parties', []):
+                        if not party.get('is_state_party', False):
+                            pd_non_state_parties.append(party['name'])
+            
+            print(f"🔍 Found {len(pd_non_state_parties)} unique non-state parties in active PD cases")
+            
+            # Determine which COA cases should have briefs downloaded
+            eligible_coa_cases = []
+            for case in coa_cases:
+                # Check for non-state parties first
+                non_state_parties = [p for p in case.get('parties', []) if not p.get('is_state_party', False)]
+                if not non_state_parties:
+                    case['brief_download_reason'] = "No non-state parties found"
+                    case['filtered_out'] = True
+                    case['filter_reason'] = 'No non-state parties'
+                    continue
+                
+                # Check if any non-state parties have concurrent PD cases (BEFORE mandate check)
+                parties_with_pd_cases = []
+                for party in non_state_parties:
+                    coa_party_name = party['name']
+                    # Check if this COA party matches any PD party
+                    for pd_party_name in pd_non_state_parties:
+                        if names_match(coa_party_name, pd_party_name):
+                            parties_with_pd_cases.append(f"{coa_party_name} (matches PD: {pd_party_name})")
+                            break  # Found a match, no need to check other PD parties
+                
+                if parties_with_pd_cases:
+                    case['brief_download_reason'] = f"Parties have concurrent PD cases: {', '.join(parties_with_pd_cases)}"
+                    case['filtered_out'] = True
+                    case['filter_reason'] = 'Concurrent PD cases'
+                    continue
+                
+                # Check if last calendar date was over a year ago
+                calendar_events = case.get('calendar_events', [])
+                if calendar_events:
+                    # Find the most recent calendar date
+                    most_recent_date = None
+                    for event in calendar_events:
+                        event_date_str = event.get('date', '').strip()
+                        if event_date_str:
+                            try:
+                                # Parse date in MM/DD/YYYY format
+                                event_date = datetime.strptime(event_date_str, '%m/%d/%Y')
+                                if most_recent_date is None or event_date > most_recent_date:
+                                    most_recent_date = event_date
+                            except ValueError:
+                                continue
+                    
+                    if most_recent_date:
+                        one_year_ago = datetime.now() - timedelta(days=365)
+                        if most_recent_date < one_year_ago:
+                            case['brief_download_reason'] = f"Last calendar date was over a year ago ({most_recent_date.strftime('%m/%d/%Y')})"
+                            case['filtered_out'] = True
+                            case['filter_reason'] = 'Stale case (>1 year)'
+                            continue
+                
+                # Check if mandate has been issued (after PD case check and date check)
+                if case.get('mandate_issued', False):
+                    case['brief_download_reason'] = "Mandate has been issued"
+                    case['filtered_out'] = True
+                    case['filter_reason'] = 'Mandate issued'
+                    continue
+                
+                # This case is eligible for brief download
+                case['brief_download_reason'] = f"Eligible: COA case with {len(non_state_parties)} non-state parties, no concurrent PD cases, mandate not issued, recent activity"
+                eligible_coa_cases.append(case)
+            
+            print(f"\n📥 BRIEF DOWNLOAD ANALYSIS:")
+            print(f"   • Eligible COA cases: {len(eligible_coa_cases)}")
+            print(f"   • Filtered COA cases: {len(coa_cases) - len(eligible_coa_cases)}")
+            
+            # Download briefs for eligible cases
+            if eligible_coa_cases:
+                print(f"\n🔄 Downloading briefs for {len(eligible_coa_cases)} eligible COA cases...")
+                brief_progress = tqdm(eligible_coa_cases, desc="📥 Downloading briefs", unit="case")
+                
+                for case in brief_progress:
+                    case_number = case['case_number']
+                    brief_progress.set_description(f"Downloading briefs for {case_number}")
+                    
+                    try:
+                        # Check if briefs are already downloaded
+                        already_downloaded, existing_briefs = briefs_already_downloaded(case_number, output_folder)
+                        if already_downloaded:
+                            brief_progress.write(f"📁 Briefs already downloaded for {case_number}: {len(existing_briefs)} files")
+                            # Create brief info from existing files
+                            case['briefs_downloaded'] = []
+                            for brief_file in existing_briefs:
+                                case['briefs_downloaded'].append({
+                                    'filepath': os.path.join(output_folder, "briefs", brief_file),
+                                    'description': brief_file.replace(case_number + "_", "").replace(".pdf", ""),
+                                    'case_number': case_number
+                                })
+                            brief_progress.set_postfix(briefs=len(existing_briefs))
+                            continue
+                        
+                        # Navigate to case page
+                        url = f"https://search.txcourts.gov/Case.aspx?cn={case_number}"
+                        driver.get(url)
+                        
+                        # Wait for page to load
+                        WebDriverWait(driver, 30).until(
+                            EC.any_of(
+                                EC.presence_of_element_located((By.ID, "ctl00_ContentPlaceHolder1_grdEvents_ctl00")),
+                                EC.presence_of_element_located((By.ID, "ctl00_ContentPlaceHolder1_grdBriefs_ctl00")),
+                                EC.presence_of_element_located((By.CLASS_NAME, "panel-content"))
+                            )
+                        )
+                        
+                        # Parse page and download briefs
+                        soup = BeautifulSoup(driver.page_source, 'html.parser')
+                        print(f"📥 Downloading briefs for {case_number}: {case['brief_download_reason']}")
+                        
+                        # Check for Anders briefs BEFORE downloading
+                        has_anders_brief = False
+                        
+                        # Check brief descriptions in the docGrid table
+                        doc_grid = soup.find('table', {'id': 'ctl00_ContentPlaceHolder1_grdBriefs_ctl00'})
+                        if doc_grid:
+                            rows = doc_grid.find_all('tr')
+                            for row in rows[1:]:  # Skip header row
+                                cells = row.find_all('td')
+                                if len(cells) >= 2:
+                                    description = cells[1].get_text(strip=True).lower()
+                                    if 'anders' in description:
+                                        has_anders_brief = True
+                                        break
+                        
+                        if has_anders_brief:
+                            case['brief_download_reason'] = "Case contains Anders brief - filtered out"
+                            case['filtered_out'] = True
+                            case['filter_reason'] = 'Anders brief'
+                            case['briefs_downloaded'] = []
+                            brief_progress.set_postfix(briefs=0)
+                            continue
+                        
+                        briefs_downloaded = download_briefs_for_case(driver, soup, case_number, output_folder)
+                        case['briefs_downloaded'] = briefs_downloaded
+                        
+                        brief_progress.set_postfix(briefs=len(briefs_downloaded))
+                        
+                    except Exception as e:
+                        brief_progress.write(f"Error downloading briefs for {case_number}: {str(e)}")
+                        case['briefs_downloaded'] = []
+                        continue
+                
+                brief_progress.close()
+            
+            # PHASE 3: Analyze briefs with Claude and generate comprehensive report
+            print("\n" + "="*60)
+            print("📋 PHASE 3: ANALYZING BRIEFS WITH CLAUDE")
+            print("="*60)
+            
+            # Run Claude analysis
+            eligible_coa_cases = run_claude_analysis(all_case_details, output_folder, analysis_only=False)
         
-        # Generate comprehensive case report even without Claude analysis
-        if not api_key:
-            print(f"\n📄 GENERATING COMPREHENSIVE CASE REPORT (WITHOUT CLAUDE ANALYSIS)")
-            print("=" * 40)
-            generate_comprehensive_case_report(eligible_coa_cases, output_folder)
-            print("=" * 40)
-        
-        # Save results
-        print(f"\n💾 SAVING RESULTS")
-        print("=" * 40)
-        print(f"📁 Output folder: {output_folder}")
-        
-        # Save summary by bar number
-        summary_file = os.path.join(output_folder, "cases_by_bar_number.json")
-        with open(summary_file, 'w') as f:
-            json.dump(all_cases, f, indent=2)
-        print(f"✅ Saved: cases_by_bar_number.json")
-        
-        # Save detailed case information
+        # Save results (common to both modes)
         details_file = os.path.join(output_folder, "case_details.json")
         with open(details_file, 'w') as f:
             json.dump(all_case_details, f, indent=2)
         print(f"✅ Saved: case_details.json")
         
-        # Create summary report
-        report_file = os.path.join(output_folder, "summary_report.txt")
-        total_docs = sum(len(case['documents']) for case in all_case_details if not case.get('filtered_out', False))
-        total_calendar_events = sum(len(case['calendar_events']) for case in all_case_details if not case.get('filtered_out', False))
-        total_briefs = sum(len(case.get('briefs_downloaded', [])) for case in all_case_details)
-        total_legal_issues = sum(len(case.get('legal_issues', [])) for case in all_case_details)
-        filtered_cases = sum(1 for case in all_case_details if case.get('filtered_out', False))
-        active_cases = len(all_case_details) - filtered_cases
-        
-        with open(report_file, 'w') as f:
-            f.write(f"Attorney Case Search Report\n")
-            f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
-            
-            f.write(f"Bar Numbers Searched: {', '.join(BAR_NUMBERS)}\n")
-            f.write("Courts Searched: All 17 Texas courts (15 Courts of Appeals + Supreme Court + Court of Criminal Appeals)\n\n")
-            
-            f.write("Cases by Bar Number:\n")
-            for bar_num, cases in all_cases.items():
-                f.write(f"  {bar_num}: {len(cases)} cases\n")
-            
-            f.write(f"\nTotal Unique Cases Found: {len(all_unique_cases)}\n")
-            f.write(f"Active Cases (processed): {active_cases}\n")
-            f.write(f"Filtered Cases (mandate issued): {filtered_cases}\n")
-            f.write(f"COA Cases: {len(coa_cases)}\n")
-            f.write(f"PD Cases: {len(pd_cases)}\n")
-            f.write(f"Eligible COA Cases for Brief Download: {len(eligible_coa_cases)}\n")
-            f.write(f"Total Documents Found: {total_docs}\n")
-            f.write(f"Total Calendar Events Found: {total_calendar_events}\n")
-            f.write(f"Total Briefs Downloaded: {total_briefs}\n")
-            f.write(f"Total Legal Issues Identified: {total_legal_issues}\n")
-        
-        print(f"✅ Saved: summary_report.txt")
-        
-        # Generate PDF report
-        print(f"\n📄 GENERATING PDF REPORT")
-        print("=" * 40)
-        generate_pdf_report(all_case_details, output_folder)
-        print("=" * 40)
-        
-        print(f"\n🎉 SCRAPING COMPLETE!")
-        print("=" * 60)
-        print(f"📈 Results Summary:")
-        print(f"   • {len(all_unique_cases)} unique cases found")
-        print(f"   • {active_cases} active cases processed")
-        print(f"   • {filtered_cases} cases filtered (mandate issued)")
-        print(f"   • {len(coa_cases)} COA cases")
-        print(f"   • {len(pd_cases)} PD cases")
-        print(f"   • {len(eligible_coa_cases)} eligible COA cases for brief download")
-        print(f"   • {total_docs} documents extracted")
-        print(f"   • {total_calendar_events} calendar events extracted")
-        print(f"   • {total_briefs} briefs downloaded")
-        print(f"   • {total_legal_issues} legal issues identified")
-        print(f"   • Results saved to: {output_folder}")
-        print("=" * 60)
-        
     except Exception as e:
         print(f"❌ Error during scraping: {str(e)}")
     finally:
-        print("🌐 Closing browser...")
-        driver.quit()
-        print("✅ Browser closed")
+        if driver:
+            print("🌐 Closing browser...")
+            driver.quit()
+            print("✅ Browser closed")
+
+def run_claude_analysis(all_case_details, output_folder, analysis_only=False):
+    """Run Claude analysis on cases with briefs"""
+    
+    # Separate COA and PD cases for analysis-only mode
+    if analysis_only:
+        coa_cases = [case for case in all_case_details if case.get('is_coa_case', False)]
+        eligible_coa_cases = [case for case in coa_cases if case.get('briefs_downloaded') and not case.get('filtered_out', False)]
+    else:
+        # In normal mode, eligible_coa_cases is already determined
+        eligible_coa_cases = [case for case in all_case_details if case.get('briefs_downloaded') and not case.get('filtered_out', False)]
+    
+    print(f"🔍 Found {len(eligible_coa_cases)} cases with briefs for analysis")
+    
+    # Check if API key is available
+    api_key = os.getenv('ANTHROPIC_API_KEY')
+    if not api_key:
+        print("⚠️  ANTHROPIC_API_KEY environment variable not set")
+        print("⚠️  Skipping Claude analysis. Set the API key to enable brief analysis.")
+        print("⚠️  Export ANTHROPIC_API_KEY=your_api_key_here")
+        return eligible_coa_cases
+    
+    print(f"🤖 Analyzing briefs with Claude for {len(eligible_coa_cases)} cases...")
+    
+    analysis_progress = tqdm(eligible_coa_cases, desc="🤖 Analyzing with Claude", unit="case")
+    
+    for case in analysis_progress:
+        case_number = case['case_number']
+        analysis_progress.set_description(f"Analyzing {case_number}")
+        
+        try:
+            # Check if legal issues are already analyzed
+            existing_issues = case.get('legal_issues', [])
+            if existing_issues:
+                analysis_progress.write(f"🧠 Legal issues already analyzed for {case_number}: {len(existing_issues)} issues")
+                analysis_progress.set_postfix(issues=len(existing_issues))
+                continue
+            
+            analyze_case_briefs(case, output_folder)
+            
+            # Save updated case details to JSON immediately after analysis
+            details_file = os.path.join(output_folder, "case_details.json")
+            with open(details_file, 'w') as f:
+                json.dump(all_case_details, f, indent=2)
+            
+            # Update progress with issue count
+            issue_count = len(case.get('legal_issues', []))
+            analysis_progress.set_postfix(issues=issue_count)
+            
+        except Exception as e:
+            analysis_progress.write(f"Error analyzing briefs for {case_number}: {str(e)}")
+            case['legal_issues'] = []
+            continue
+    
+    analysis_progress.close()
+    
+    # Generate comprehensive case report
+    print(f"\n📄 GENERATING COMPREHENSIVE CASE REPORT")
+    print("=" * 40)
+    generate_comprehensive_case_report(eligible_coa_cases, output_folder)
+    print("=" * 40)
+    
+    return eligible_coa_cases
+
+def main():
+    """Main function with argument parsing"""
+    parser = argparse.ArgumentParser(description='Texas Court of Appeals Case Scraper')
+    parser.add_argument('--analysis-only', action='store_true', 
+                       help='Run only Claude analysis on existing cases (skip search and brief download)')
+    
+    args = parser.parse_args()
+    
+    if args.analysis_only:
+        scrape_attorney_cases(analysis_only=True)
+    else:
+        scrape_attorney_cases(analysis_only=False)
 
 if __name__ == "__main__":
-    scrape_attorney_cases() 
+    main() 
