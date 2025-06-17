@@ -1122,10 +1122,11 @@ Focus on substantive legal arguments, not procedural matters. Consolidate simila
         error_msg = str(e)
         print(f"    ⚠️  Error analyzing briefs with Claude for {case_number}: {error_msg}")
         
-        # Check if it's a size limit error
-        if "too large" in error_msg.lower() or "limit" in error_msg.lower() or "size" in error_msg.lower():
-            print(f"    🔄 Input too large, falling back to individual brief analysis...")
-            return None  # Signal to fallback to individual processing
+        # Check if it's a size limit error (various error messages)
+        size_limit_keywords = ["too large", "limit", "size", "100 pdf pages", "maximum", "exceeded"]
+        if any(keyword in error_msg.lower() for keyword in size_limit_keywords):
+            print(f"    🔄 Input too large, falling back to smaller groups...")
+            return None  # Signal to fallback to smaller processing
         
         return []
 
@@ -1274,43 +1275,72 @@ def analyze_case_briefs(case_details, output_folder):
     
     all_issues = []
     
-    # Try to analyze all briefs together first
-    if len(valid_briefs) > 1:
-        print(f"  📄 Analyzing all {len(valid_briefs)} briefs together...")
-        issues = analyze_briefs_with_claude(valid_briefs, case_number)
+    # Try to analyze briefs with progressive fallback
+    def try_analyze_briefs_progressively(briefs_list):
+        """Try to analyze briefs with progressive fallback to smaller groups"""
+        if len(briefs_list) == 1:
+            # Single brief - analyze individually
+            brief_path, brief_description = briefs_list[0]
+            print(f"    📄 Analyzing single brief: {brief_description}")
+            issues = analyze_brief_with_claude(brief_path, case_number, brief_description)
+            
+            if issues:
+                print(f"      ✅ Found {len(issues)} legal issues")
+                for issue in issues:
+                    issue['source_brief'] = brief_description
+                return issues
+            else:
+                print(f"      ⚠️  No legal issues identified")
+                return []
+        
+        # Try analyzing all briefs together
+        print(f"    📄 Analyzing {len(briefs_list)} briefs together...")
+        issues = analyze_briefs_with_claude(briefs_list, case_number)
         
         if issues is None:
-            # Size limit error - fall back to individual analysis
-            print(f"  🔄 Falling back to individual brief analysis...")
-            for brief_path, brief_description in valid_briefs:
-                print(f"    📄 Analyzing: {brief_description}")
-                individual_issues = analyze_brief_with_claude(brief_path, case_number, brief_description)
+            # Size limit error - try smaller groups
+            if len(briefs_list) == 2:
+                print(f"    🔄 Two briefs too large, analyzing individually...")
+                # Analyze each brief individually
+                all_individual_issues = []
+                for brief_path, brief_description in briefs_list:
+                    print(f"      📄 Analyzing: {brief_description}")
+                    individual_issues = analyze_brief_with_claude(brief_path, case_number, brief_description)
+                    
+                    if individual_issues:
+                        print(f"        ✅ Found {len(individual_issues)} legal issues")
+                        for issue in individual_issues:
+                            issue['source_brief'] = brief_description
+                            all_individual_issues.append(issue)
+                    else:
+                        print(f"        ⚠️  No legal issues identified")
+                return all_individual_issues
+            else:
+                # More than 2 briefs - try splitting into smaller groups
+                print(f"    🔄 {len(briefs_list)} briefs too large, trying smaller groups...")
+                mid_point = len(briefs_list) // 2
+                first_half = briefs_list[:mid_point]
+                second_half = briefs_list[mid_point:]
                 
-                if individual_issues:
-                    print(f"      ✅ Found {len(individual_issues)} legal issues")
-                    for issue in individual_issues:
-                        issue['source_brief'] = brief_description
-                        all_issues.append(issue)
-                else:
-                    print(f"      ⚠️  No legal issues identified")
+                print(f"    🔄 Trying first group of {len(first_half)} briefs...")
+                first_issues = try_analyze_briefs_progressively(first_half)
+                
+                print(f"    🔄 Trying second group of {len(second_half)} briefs...")
+                second_issues = try_analyze_briefs_progressively(second_half)
+                
+                return first_issues + second_issues
         elif issues:
-            print(f"    ✅ Found {len(issues)} legal issues from combined analysis")
-            all_issues.extend(issues)
+            print(f"      ✅ Found {len(issues)} legal issues from combined analysis")
+            return issues
         else:
-            print(f"    ⚠️  No legal issues identified from combined analysis")
+            print(f"      ⚠️  No legal issues identified from combined analysis")
+            return []
+    
+    if len(valid_briefs) > 0:
+        print(f"  📄 Starting analysis of {len(valid_briefs)} briefs...")
+        all_issues = try_analyze_briefs_progressively(valid_briefs)
     else:
-        # Only one brief - analyze individually
-        brief_path, brief_description = valid_briefs[0]
-        print(f"  📄 Analyzing single brief: {brief_description}")
-        issues = analyze_brief_with_claude(brief_path, case_number, brief_description)
-        
-        if issues:
-            print(f"    ✅ Found {len(issues)} legal issues")
-            for issue in issues:
-                issue['source_brief'] = brief_description
-                all_issues.append(issue)
-        else:
-            print(f"    ⚠️  No legal issues identified")
+        all_issues = []
     
     # Remove duplicate issues (for fallback individual analysis)
     unique_issues = []
