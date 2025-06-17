@@ -991,6 +991,95 @@ def generate_pdf_report(all_case_details, output_folder):
     print(f"✅ Generated PDF report: {pdf_file}")
     return pdf_file
 
+def parse_claude_json_response(response_text, case_number):
+    """Enhanced JSON parsing for Claude responses with multiple fallback methods"""
+    import json
+    import re
+    
+    try:
+        # First try to find JSON in markdown code blocks
+        if "```json" in response_text:
+            json_start = response_text.find("```json") + 7
+            json_end = response_text.find("```", json_start)
+            if json_end != -1:
+                response_text = response_text[json_start:json_end].strip()
+        elif "```" in response_text:
+            json_start = response_text.find("```") + 3
+            json_end = response_text.rfind("```")
+            if json_end != -1:
+                response_text = response_text[json_start:json_end].strip()
+        
+        # If no markdown blocks, try to extract complete JSON using regex
+        if not response_text.strip().startswith('{'):
+            # Look for complete JSON object from { to matching }
+            json_match = re.search(r'\{(?:[^{}]|{[^{}]*})*\}', response_text, re.DOTALL)
+            if json_match:
+                response_text = json_match.group(0)
+        
+        # Clean up the JSON text
+        response_text = response_text.strip()
+        
+        # Try parsing the JSON directly
+        result = json.loads(response_text)
+        return result.get('issues', [])
+        
+    except json.JSONDecodeError as e:
+        print(f"    ⚠️  JSON parsing error for {case_number}: {str(e)}")
+        
+        # Enhanced fallback parsing
+        try:
+            # Method 1: Try to fix common JSON issues
+            fixed_response = response_text
+            
+            # Remove trailing commas before closing brackets/braces
+            fixed_response = re.sub(r',(\s*[\]\}])', r'\1', fixed_response)
+            
+            # Try parsing the fixed version
+            result = json.loads(fixed_response)
+            print(f"    ✅ Fixed JSON parsing for {case_number}")
+            return result.get('issues', [])
+            
+        except json.JSONDecodeError:
+            # Method 2: Extract issues array with more robust regex
+            try:
+                # Look for the issues array specifically, handling nested objects
+                issues_pattern = r'"issues"\s*:\s*\[((?:[^[\]]|\[[^\]]*\])*)\]'
+                issues_match = re.search(issues_pattern, response_text, re.DOTALL)
+                
+                if issues_match:
+                    issues_content = issues_match.group(1).strip()
+                    
+                    # Split individual issue objects
+                    issue_objects = []
+                    brace_count = 0
+                    current_object = ""
+                    
+                    for char in issues_content:
+                        current_object += char
+                        if char == '{':
+                            brace_count += 1
+                        elif char == '}':
+                            brace_count -= 1
+                            if brace_count == 0:
+                                # Complete object found
+                                try:
+                                    issue_obj = json.loads(current_object.strip().rstrip(','))
+                                    issue_objects.append(issue_obj)
+                                except:
+                                    pass
+                                current_object = ""
+                    
+                    if issue_objects:
+                        print(f"    ✅ Extracted {len(issue_objects)} issues using fallback parsing for {case_number}")
+                        return issue_objects
+            
+            except Exception as fallback_error:
+                print(f"    ⚠️  Fallback parsing also failed for {case_number}: {str(fallback_error)}")
+        
+        # Last resort: show truncated response for debugging
+        print(f"    📝 Response preview: {response_text[:200]}...")
+        return []
+
 def count_pdf_pages(pdf_path):
     """Count the number of pages in a PDF file"""
     try:
@@ -1125,51 +1214,8 @@ Focus on substantive legal arguments, not procedural matters. Consolidate simila
         
         response_text = message.content[0].text
         
-        # Try to parse JSON response
-        try:
-            import json
-            import re
-            
-            # First try to find JSON in markdown code blocks
-            if "```json" in response_text:
-                json_start = response_text.find("```json") + 7
-                json_end = response_text.find("```", json_start)
-                if json_end != -1:
-                    response_text = response_text[json_start:json_end].strip()
-            elif "```" in response_text:
-                json_start = response_text.find("```") + 3
-                json_end = response_text.rfind("```")
-                if json_end != -1:
-                    response_text = response_text[json_start:json_end].strip()
-            
-            # If no markdown blocks, try to extract JSON using regex
-            if not response_text.strip().startswith('{'):
-                json_match = re.search(r'\{.*?\}', response_text, re.DOTALL)
-                if json_match:
-                    response_text = json_match.group(0)
-            
-            # Clean up the JSON text
-            response_text = response_text.strip()
-            
-            # Try parsing the JSON
-            result = json.loads(response_text)
-            return result.get('issues', [])
-            
-        except json.JSONDecodeError as e:
-            print(f"    ⚠️  Error parsing Claude response for {case_number}: {str(e)}")
-            print(f"    Response was: {response_text[:500]}...")
-            
-            # Try a more aggressive approach - look for the issues array specifically
-            try:
-                issues_match = re.search(r'"issues"\s*:\s*\[(.*?)\]', response_text, re.DOTALL)
-                if issues_match:
-                    issues_json = '{"issues":[' + issues_match.group(1) + ']}'
-                    result = json.loads(issues_json)
-                    return result.get('issues', [])
-            except:
-                pass
-            
-            return []
+        # Parse JSON response using enhanced parser
+        return parse_claude_json_response(response_text, case_number)
             
     except Exception as e:
         error_msg = str(e)
@@ -1241,51 +1287,8 @@ Focus on substantive legal arguments, not procedural matters. Return your analys
         
         response_text = message.content[0].text
         
-        # Try to parse JSON response
-        try:
-            import json
-            import re
-            
-            # First try to find JSON in markdown code blocks
-            if "```json" in response_text:
-                json_start = response_text.find("```json") + 7
-                json_end = response_text.find("```", json_start)
-                if json_end != -1:
-                    response_text = response_text[json_start:json_end].strip()
-            elif "```" in response_text:
-                json_start = response_text.find("```") + 3
-                json_end = response_text.rfind("```")
-                if json_end != -1:
-                    response_text = response_text[json_start:json_end].strip()
-            
-            # If no markdown blocks, try to extract JSON using regex
-            if not response_text.strip().startswith('{'):
-                json_match = re.search(r'\{.*?\}', response_text, re.DOTALL)
-                if json_match:
-                    response_text = json_match.group(0)
-            
-            # Clean up the JSON text
-            response_text = response_text.strip()
-            
-            # Try parsing the JSON
-            result = json.loads(response_text)
-            return result.get('issues', [])
-            
-        except json.JSONDecodeError as e:
-            print(f"    ⚠️  Error parsing Claude response for {case_number}: {str(e)}")
-            print(f"    Response was: {response_text[:500]}...")
-            
-            # Try a more aggressive approach - look for the issues array specifically
-            try:
-                issues_match = re.search(r'"issues"\s*:\s*\[(.*?)\]', response_text, re.DOTALL)
-                if issues_match:
-                    issues_json = '{"issues":[' + issues_match.group(1) + ']}'
-                    result = json.loads(issues_json)
-                    return result.get('issues', [])
-            except:
-                pass
-            
-            return []
+        # Parse JSON response using enhanced parser
+        return parse_claude_json_response(response_text, case_number)
             
     except Exception as e:
         print(f"    ⚠️  Error analyzing brief with Claude for {case_number}: {str(e)}")
