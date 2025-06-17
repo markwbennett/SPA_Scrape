@@ -1100,6 +1100,71 @@ def count_pdf_pages(pdf_path):
             print(f"    ⚠️  Could not count pages for {pdf_path}, assuming 10 pages")
             return 10  # Conservative fallback
 
+def extract_pdf_text(pdf_path, max_pages=100):
+    """Extract text from PDF file, limiting to max_pages"""
+    try:
+        import PyPDF2
+        text_content = ""
+        
+        with open(pdf_path, 'rb') as f:
+            reader = PyPDF2.PdfReader(f)
+            total_pages = len(reader.pages)
+            pages_to_extract = min(total_pages, max_pages)
+            
+            for page_num in range(pages_to_extract):
+                try:
+                    page = reader.pages[page_num]
+                    text_content += page.extract_text() + "\n\n"
+                except Exception as e:
+                    print(f"    ⚠️  Error extracting page {page_num + 1}: {e}")
+                    continue
+            
+            if total_pages > max_pages:
+                print(f"    📄 Extracted text from first {max_pages} of {total_pages} pages")
+            else:
+                print(f"    📄 Extracted text from all {total_pages} pages")
+                
+            return text_content.strip()
+            
+    except Exception as e:
+        print(f"    ⚠️  Error extracting text from {pdf_path}: {e}")
+        return None
+
+def truncate_pdf_to_pages(pdf_path, max_pages=100):
+    """Create a base64 encoded PDF with only the first max_pages"""
+    try:
+        import PyPDF2
+        import base64
+        import io
+        
+        with open(pdf_path, 'rb') as f:
+            reader = PyPDF2.PdfReader(f)
+            total_pages = len(reader.pages)
+            
+            if total_pages <= max_pages:
+                # PDF is already within limit, return as-is
+                pdf_content = f.read()
+                return base64.b64encode(pdf_content).decode('utf-8'), total_pages
+            
+            # Create new PDF with only first max_pages
+            from PyPDF2 import PdfWriter
+            writer = PdfWriter()
+            
+            for page_num in range(max_pages):
+                writer.add_page(reader.pages[page_num])
+            
+            # Write to bytes
+            output_buffer = io.BytesIO()
+            writer.write(output_buffer)
+            truncated_pdf = output_buffer.getvalue()
+            
+            print(f"    ✂️  Truncated PDF from {total_pages} to {max_pages} pages")
+            return base64.b64encode(truncated_pdf).decode('utf-8'), max_pages
+            
+    except Exception as e:
+        print(f"    ⚠️  Error truncating PDF {pdf_path}: {e}")
+        return None, 0
+
 def create_optimal_batches(briefs_with_pages, max_pages=100):
     """Create optimal batches of briefs that stay under the page limit"""
     batches = []
@@ -1276,11 +1341,78 @@ Focus on substantive legal arguments, not procedural matters. Consolidate simila
             print(f"    🔄 Resuming analysis after rate limit backoff...")
             return None  # Signal to retry or skip for now
         
+        # Check if it's a PDF processing error
+        if "could not process pdf" in error_msg.lower() or "pdf" in error_msg.lower():
+            print(f"    🔄 PDF processing error for batch, will try individual briefs...")
+            return "PROCESS_INDIVIDUALLY"  # Signal to process briefs individually
+        
         # Check if it's a size limit error (various error messages)
         size_limit_keywords = ["too large", "limit", "size", "100 pdf pages", "maximum", "exceeded"]
         if any(keyword in error_msg.lower() for keyword in size_limit_keywords):
             print(f"    🔄 Input too large, falling back to smaller groups...")
             return None  # Signal to fallback to smaller processing
+        
+        return []
+
+def analyze_brief_text_with_claude(text_content, case_number, brief_description):
+    """Analyze extracted text from a legal brief with Claude"""
+    try:
+        # Get API key from environment variable
+        api_key = os.getenv('ANTHROPIC_API_KEY')
+        if not api_key:
+            print("❌ ANTHROPIC_API_KEY not found in .env file")
+            return []
+        
+        client = anthropic.Anthropic(api_key=api_key)
+        
+        # Create message with text content
+        message = client.messages.create(
+            model="claude-3-5-sonnet-20241022",
+            max_tokens=4000,
+            messages=[
+                {
+                    "role": "user",
+                    "content": f"""You are a legal expert analyzing a criminal appellate brief from Texas courts. Please analyze this brief text from case {case_number} ({brief_description}) and identify the distinct legal issues raised.
+
+BRIEF TEXT:
+{text_content[:50000]}  
+
+For each legal issue, provide:
+1. A concise description of the issue (1-2 sentences)
+2. The specific legal area (e.g., "Fourth Amendment Search and Seizure", "Ineffective Assistance of Counsel", "Sufficiency of Evidence", etc.)
+
+Focus on substantive legal arguments, not procedural matters. Return your analysis in JSON format with an array of issues:
+
+{{
+  "issues": [
+    {{
+      "description": "Brief description of the legal issue",
+      "legal_area": "Specific area of law"
+    }}
+  ]
+}}"""
+                }
+            ]
+        )
+        
+        response_text = message.content[0].text
+        
+        # Parse JSON response using enhanced parser
+        return parse_claude_json_response(response_text, case_number)
+            
+    except Exception as e:
+        error_msg = str(e)
+        print(f"    ⚠️  Error analyzing brief text with Claude for {case_number}: {error_msg}")
+        
+        # Check if it's a rate limit error
+        if "429" in error_msg or "rate_limit_error" in error_msg.lower() or "rate limit" in error_msg.lower():
+            print(f"    🛑 Rate limit exceeded for {case_number}. Backing off...")
+            import time
+            # Wait 60 seconds before retrying
+            print(f"    ⏰ Waiting 60 seconds before continuing...")
+            time.sleep(60)
+            print(f"    🔄 Resuming analysis after rate limit backoff...")
+            return None  # Signal to retry or skip for now
         
         return []
 
@@ -1295,10 +1427,25 @@ def analyze_brief_with_claude(brief_path, case_number, brief_description):
         
         client = anthropic.Anthropic(api_key=api_key)
         
-        # Read the PDF file as binary and encode as base64
-        import base64
-        with open(brief_path, 'rb') as f:
-            pdf_content = base64.b64encode(f.read()).decode('utf-8')
+        # Check if PDF is too large and truncate if necessary
+        page_count = count_pdf_pages(brief_path)
+        if page_count > 100:
+            print(f"    ✂️  PDF has {page_count} pages, truncating to first 100 pages")
+            pdf_content, actual_pages = truncate_pdf_to_pages(brief_path, 100)
+            if pdf_content is None:
+                # Fallback to text extraction if truncation fails
+                print(f"    🔄 PDF truncation failed, extracting text instead...")
+                text_content = extract_pdf_text(brief_path, 100)
+                if text_content:
+                    return analyze_brief_text_with_claude(text_content, case_number, brief_description)
+                else:
+                    print(f"    ⚠️  Text extraction also failed for {brief_path}")
+                    return []
+        else:
+            # Read the PDF file as binary and encode as base64
+            import base64
+            with open(brief_path, 'rb') as f:
+                pdf_content = base64.b64encode(f.read()).decode('utf-8')
         
         # Create message with PDF attachment
         message = client.messages.create(
@@ -1358,6 +1505,16 @@ Focus on substantive legal arguments, not procedural matters. Return your analys
             time.sleep(60)
             print(f"    🔄 Resuming analysis after rate limit backoff...")
             return None  # Signal to retry or skip for now
+        
+        # Check if it's a PDF processing error - fallback to text extraction
+        if "could not process pdf" in error_msg.lower() or ("pdf" in error_msg.lower() and "process" in error_msg.lower()):
+            print(f"    🔄 PDF processing failed, extracting text instead...")
+            text_content = extract_pdf_text(brief_path, 100)
+            if text_content:
+                return analyze_brief_text_with_claude(text_content, case_number, brief_description)
+            else:
+                print(f"    ⚠️  Text extraction also failed for {brief_path}")
+                return []
         
         return []
 
@@ -1446,6 +1603,25 @@ def analyze_case_briefs(case_details, output_folder):
                 # Rate limit or other error that requires retry - don't advance batch_index
                 print(f"    🔄 Retrying batch {batch_index + 1} after backoff...")
                 continue
+            elif issues == "PROCESS_INDIVIDUALLY":
+                # PDF processing error - process each brief individually
+                print(f"    🔄 Processing briefs individually due to PDF error...")
+                batch_issues = []
+                for brief_path, brief_description in batch_briefs:
+                    individual_issues = analyze_brief_with_claude(brief_path, case_number, brief_description)
+                    if individual_issues and individual_issues != "PROCESS_INDIVIDUALLY":
+                        print(f"      ✅ Found {len(individual_issues)} issues from {brief_description}")
+                        for issue in individual_issues:
+                            issue['source_brief'] = brief_description
+                            batch_issues.append(issue)
+                    else:
+                        print(f"      ⚠️  No issues found from {brief_description}")
+                
+                if batch_issues:
+                    print(f"    ✅ Found {len(batch_issues)} total issues from individual processing")
+                    all_issues.extend(batch_issues)
+                else:
+                    print(f"    ⚠️  No issues found from individual processing")
             elif issues:
                 print(f"    ✅ Found {len(issues)} new/expanded legal issues from batch {batch_index + 1}")
                 all_issues.extend(issues)
