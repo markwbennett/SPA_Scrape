@@ -1,0 +1,19 @@
+Attorney Case Search Report
+Generated: 2025-06-17 12:22:20
+
+Bar Numbers Searched: 24032600
+Courts Searched: All 17 Texas courts (15 Courts of Appeals + Supreme Court + Court of Criminal Appeals)
+
+Cases by Bar Number:
+  24032600: 21 cases
+
+Total Unique Cases Found: 21
+Active Cases (processed): 16
+Filtered Cases (mandate issued): 5
+COA Cases: 5
+PD Cases: 11
+Eligible COA Cases for Brief Download: 4
+Total Documents Found: 375
+Total Calendar Events Found: 17
+Total Briefs Downloaded: 3
+Total Legal Issues Identified: 0
