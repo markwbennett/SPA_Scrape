@@ -1133,7 +1133,7 @@ def create_optimal_batches(briefs_with_pages, max_pages=100):
     
     return batches
 
-def analyze_briefs_with_claude(brief_paths_and_descriptions, case_number):
+def analyze_briefs_with_claude(brief_paths_and_descriptions, case_number, prior_issues=None):
     """Analyze multiple legal brief PDFs with Claude to extract legal issues"""
     try:
         # Get API key from environment variable
@@ -1175,9 +1175,50 @@ def analyze_briefs_with_claude(brief_paths_and_descriptions, case_number):
         # Create the analysis prompt
         brief_list = "\n".join([f"- {desc}" for desc in brief_descriptions])
         
-        content.append({
-            "type": "text",
-            "text": f"""You are a legal expert analyzing criminal appellate briefs from Texas courts. Please analyze ALL the briefs provided for case {case_number} and identify the distinct legal issues raised across all briefs.
+        # Build prompt based on whether we have prior issues
+        if prior_issues and len(prior_issues) > 0:
+            # Format prior issues for Claude
+            prior_issues_text = "\n".join([
+                f"- {issue.get('legal_area', 'General')}: {issue.get('description', 'No description')}"
+                for issue in prior_issues
+            ])
+            
+            prompt_text = f"""You are a legal expert analyzing criminal appellate briefs from Texas courts. 
+
+CONTEXT: I have already analyzed some briefs for case {case_number} and identified the following legal issues:
+
+PREVIOUSLY IDENTIFIED ISSUES:
+{prior_issues_text}
+
+NEW BRIEFS TO ANALYZE:
+{brief_list}
+
+TASK: Please analyze these NEW briefs and determine:
+1. What NEW legal issues are raised that were NOT in the previous analysis
+2. What CHANGES or ADDITIONS to existing issues are made by these new briefs
+3. Consolidate similar issues and avoid duplicating issues already identified
+
+For each NEW or CHANGED issue, provide:
+1. A concise description of the issue (1-2 sentences)
+2. The specific legal area (e.g., "Fourth Amendment Search and Seizure", "Ineffective Assistance of Counsel", "Sufficiency of Evidence", etc.)
+3. Which brief(s) raised this issue
+4. Whether this is "new" or "expanded" (if it adds detail to an existing issue)
+
+Focus on substantive legal arguments, not procedural matters. Return your analysis in JSON format:
+
+{{
+  "issues": [
+    {{
+      "description": "Brief description of the legal issue",
+      "legal_area": "Specific area of law",
+      "source_briefs": ["brief description 1", "brief description 2"],
+      "status": "new" or "expanded"
+    }}
+  ]
+}}"""
+        else:
+            # First batch - analyze normally
+            prompt_text = f"""You are a legal expert analyzing criminal appellate briefs from Texas courts. Please analyze ALL the briefs provided for case {case_number} and identify the distinct legal issues raised across all briefs.
 
 The briefs included are:
 {brief_list}
@@ -1198,6 +1239,10 @@ Focus on substantive legal arguments, not procedural matters. Consolidate simila
     }}
   ]
 }}"""
+        
+        content.append({
+            "type": "text",
+            "text": prompt_text
         })
         
         # Create message with all PDF attachments
@@ -1377,30 +1422,37 @@ def analyze_case_briefs(case_details, output_folder):
         for desc in batch_descriptions:
             print(f"      - {desc}")
     
-    # Analyze each batch with rate limit handling
+    # Analyze each batch with rate limit handling and incremental issue building
     batch_index = 0
     while batch_index < len(batches):
         batch = batches[batch_index]
         batch_briefs = [(path, desc) for path, desc, _ in batch]
         batch_pages = sum(pages for _, _, pages in batch)
         
-        print(f"  🔍 Analyzing batch {batch_index + 1}/{len(batches)} ({len(batch_briefs)} brief(s), {batch_pages} pages)...")
+        # Prepare prior issues for this batch (all issues found so far)
+        prior_issues = all_issues.copy() if batch_index > 0 else None
+        prior_count = len(prior_issues) if prior_issues else 0
+        
+        if prior_issues:
+            print(f"  🔍 Analyzing batch {batch_index + 1}/{len(batches)} ({len(batch_briefs)} brief(s), {batch_pages} pages) with {prior_count} prior issues...")
+        else:
+            print(f"  🔍 Analyzing batch {batch_index + 1}/{len(batches)} ({len(batch_briefs)} brief(s), {batch_pages} pages)...")
         
         if len(batch_briefs) > 1:
-            # Multiple briefs in batch - analyze together
-            issues = analyze_briefs_with_claude(batch_briefs, case_number)
+            # Multiple briefs in batch - analyze together with prior issues
+            issues = analyze_briefs_with_claude(batch_briefs, case_number, prior_issues)
             
             if issues is None:
                 # Rate limit or other error that requires retry - don't advance batch_index
                 print(f"    🔄 Retrying batch {batch_index + 1} after backoff...")
                 continue
             elif issues:
-                print(f"    ✅ Found {len(issues)} legal issues from batch {batch_index + 1}")
+                print(f"    ✅ Found {len(issues)} new/expanded legal issues from batch {batch_index + 1}")
                 all_issues.extend(issues)
             else:
-                print(f"    ⚠️  No issues found from batch {batch_index + 1}")
+                print(f"    ⚠️  No new issues found from batch {batch_index + 1}")
         else:
-            # Single brief in batch
+            # Single brief in batch - use individual analysis (no prior issues context for single briefs)
             brief_path, brief_description = batch_briefs[0]
             issues = analyze_brief_with_claude(brief_path, case_number, brief_description)
             
