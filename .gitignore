@@ -61,4 +61,9 @@ secrets.json
 coa_scrape_*/
 output/
 downloads/
-temp/ 
+temp/
+
+# Downloaded data and briefs
+data/briefs/
+data/*.json
+*.pdf
