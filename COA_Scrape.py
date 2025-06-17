@@ -514,15 +514,27 @@ def download_briefs_for_case(driver, soup, case_number, output_folder):
                             
                             link = link_cell.find('a', href=True)
                             if link and 'SearchMedia.aspx' in link['href']:
-                                doc_description = desc_cell.get_text(strip=True).lower()
+                                doc_description = desc_cell.get_text(strip=True)
+                                doc_description_lower = doc_description.lower()
                                 
-                                # Only download if it's a brief, not a notice
-                                if 'brief' in doc_description and 'notice' not in doc_description:
+                                # Include various brief types but exclude notices
+                                is_brief = any(brief_type in doc_description_lower for brief_type in [
+                                    'brief', 'reply brief', 'appellant brief', 'appellee brief', 
+                                    'state brief', 'petitioner brief', 'respondent brief',
+                                    'opening brief', 'closing brief', 'supplemental brief',
+                                    'amicus brief', 'amicus curiae brief', 'sur-reply brief',
+                                    'appellant\'s brief', 'appellee\'s brief', 'state\'s brief',
+                                    'petitioner\'s brief', 'respondent\'s brief', 'reply'
+                                ])
+                                
+                                is_notice = 'notice' in doc_description_lower
+                                
+                                if is_brief and not is_notice:
                                     brief_events.append({
                                         'date': event_date,
                                         'event_type': event_type,
                                         'url': f"https://search.txcourts.gov/{link['href']}",
-                                        'description': desc_cell.get_text(strip=True)
+                                        'description': doc_description
                                     })
                                     print(f"📄 Found brief: {doc_description} for {case_number}")
                                 else:
