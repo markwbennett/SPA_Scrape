@@ -33,6 +33,164 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv()
 
+def normalize_name_for_matching(name):
+    """
+    Normalize a name for matching purposes, handling different formats:
+    - "Smith, John A. Jr." -> "john a smith jr"
+    - "John A. Smith Jr." -> "john a smith jr"
+    - "SMITH, JOHN ALAN JR" -> "john alan smith jr"
+    """
+    if not name or not isinstance(name, str):
+        return ""
+    
+    # Store original to check for comma format
+    original = name.strip()
+    
+    # Remove extra whitespace and convert to lowercase
+    name = name.strip().lower()
+    
+    # Remove common punctuation except periods in middle initials
+    name = re.sub(r'[,]', ' ', name)
+    
+    # Normalize multiple spaces to single space
+    name = re.sub(r'\s+', ' ', name).strip()
+    
+    # Split into parts
+    parts = name.split()
+    if len(parts) < 2:
+        return name
+    
+    # Handle suffixes (Jr, Sr, II, III, IV, etc.)
+    suffixes = {'jr', 'sr', 'ii', 'iii', 'iv', 'v', 'junior', 'senior'}
+    suffix_parts = []
+    name_parts = []
+    
+    for part in parts:
+        clean_part = part.replace('.', '')  # Remove periods for suffix check
+        if clean_part in suffixes:
+            suffix_parts.append(clean_part)
+        else:
+            name_parts.append(part)
+    
+    if len(name_parts) < 2:
+        return ' '.join(parts)
+    
+    # Create normalized form: first_name middle_names last_name suffix
+    # This handles both "Last, First Middle" and "First Middle Last" formats
+    if ',' in original:
+        # "Last, First Middle" format
+        last_name = name_parts[0]
+        first_and_middle = name_parts[1:]
+        normalized = ' '.join(first_and_middle + [last_name])
+    else:
+        # "First Middle Last" format - keep as is
+        normalized = ' '.join(name_parts)
+    
+    # Add suffixes at the end
+    if suffix_parts:
+        normalized += ' ' + ' '.join(suffix_parts)
+    
+    return normalized.strip()
+
+def names_match(name1, name2):
+    """
+    Check if two names refer to the same person, handling different formats:
+    - "Smith, John A. Jr." matches "John A. Smith Jr."
+    - Case insensitive matching
+    - Handles suffixes and middle names/initials
+    - Middle names/initials are included in first name comparison
+    """
+    if not name1 or not name2:
+        return False
+    
+    norm1 = normalize_name_for_matching(name1)
+    norm2 = normalize_name_for_matching(name2)
+    
+    # Direct match
+    if norm1 == norm2:
+        return True
+    
+    # Split into components for more flexible matching
+    parts1 = norm1.split()
+    parts2 = norm2.split()
+    
+    if len(parts1) < 2 or len(parts2) < 2:
+        return False
+    
+    # Extract components
+    suffixes = {'jr', 'sr', 'ii', 'iii', 'iv', 'v', 'junior', 'senior'}
+    
+    def extract_name_components(parts):
+        name_parts = [p for p in parts if p not in suffixes]
+        suffix_parts = [p for p in parts if p in suffixes]
+        
+        if len(name_parts) >= 2:
+            # Last part is last name, everything else is first + middle
+            last = name_parts[-1]
+            first_and_middle = name_parts[:-1]
+            return first_and_middle, last, suffix_parts
+        return [], None, suffix_parts
+    
+    first_middle1, last1, suffix1 = extract_name_components(parts1)
+    first_middle2, last2, suffix2 = extract_name_components(parts2)
+    
+    if not first_middle1 or not last1 or not first_middle2 or not last2:
+        return False
+    
+    # Last names must match
+    if last1 != last2:
+        return False
+    
+    # Suffixes should match if both have them (allow equivalent forms)
+    if suffix1 and suffix2:
+        # Normalize suffix equivalents
+        def normalize_suffixes(suffix_list):
+            normalized = []
+            for s in suffix_list:
+                if s in ['sr', 'senior']:
+                    normalized.append('sr')
+                elif s in ['jr', 'junior']:
+                    normalized.append('jr')
+                else:
+                    normalized.append(s)
+            return set(normalized)
+        
+        norm_suffix1 = normalize_suffixes(suffix1)
+        norm_suffix2 = normalize_suffixes(suffix2)
+        
+        if norm_suffix1 != norm_suffix2:
+            return False
+    
+    # Check first name + middle name compatibility
+    # At minimum, first names must match
+    if first_middle1[0] != first_middle2[0]:
+        return False
+    
+    # If both have middle names/initials, they should be compatible
+    if len(first_middle1) > 1 and len(first_middle2) > 1:
+        # Both have middle names - check if they match or are compatible
+        middle1 = first_middle1[1:]
+        middle2 = first_middle2[1:]
+        
+        # Check if middle names/initials are compatible
+        for m1, m2 in zip(middle1, middle2):
+            # Remove periods for comparison
+            clean_m1 = m1.replace('.', '')
+            clean_m2 = m2.replace('.', '')
+            
+            # If one is an initial and other is full name, check if they match
+            if len(clean_m1) == 1 and len(clean_m2) > 1:
+                if clean_m1 != clean_m2[0]:
+                    return False
+            elif len(clean_m2) == 1 and len(clean_m1) > 1:
+                if clean_m2 != clean_m1[0]:
+                    return False
+            elif clean_m1 != clean_m2:
+                return False
+    
+    # If we get here, names are compatible
+    return True
+
 # Base directory for output files
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -286,7 +444,7 @@ def get_case_numbers_from_page(soup):
     return cases
 
 def is_case_closed_mandate_issued(soup):
-    """Check if case should be filtered out due to 'Mandate issued' being the top event"""
+    """Check if case should be filtered out due to mandate being issued (top event)"""
     events_table = soup.find('table', {'id': 'ctl00_ContentPlaceHolder1_grdEvents_ctl00'})
     if events_table:
         # Find the first data row (skip header)
@@ -295,8 +453,9 @@ def is_case_closed_mandate_issued(soup):
                 continue
             cells = row.find_all('td')
             if len(cells) >= 2:
-                event_type = cells[1].get_text(strip=True)
-                if 'Mandate issued' in event_type:
+                event_type = cells[1].get_text(strip=True).lower()
+                # Check for various mandate issued patterns
+                if 'mandate issued' in event_type or 'mandate issd' in event_type:
                     return True
                 break  # Only check the first event (most recent)
     return False
@@ -404,13 +563,9 @@ def extract_case_details(driver, soup, case_number, output_folder=None, all_case
         'briefs_downloaded': []
     }
     
-    # Check if case should be filtered out due to mandate issued
-    if is_case_closed_mandate_issued(soup):
-        case_info['filtered_out'] = True
-        case_info['filter_reason'] = 'Mandate issued'
-        return case_info
-    else:
-        case_info['filtered_out'] = False
+    # Don't filter for mandate here - do it later after concurrent PD case analysis
+    case_info['filtered_out'] = False
+    case_info['mandate_issued'] = is_case_closed_mandate_issued(soup)
     
     # Check if this is a COA case (starts with 2 digits)
     is_coa_case = bool(re.match(r'^\d{2}-', case_number))
@@ -1199,37 +1354,47 @@ def scrape_attorney_cases():
         print(f"   • Other cases: {len(all_case_details) - len(coa_cases) - len(pd_cases)}")
         
         # Get all non-state parties from PD cases
-        pd_non_state_parties = set()
+        pd_non_state_parties = []
         for case in pd_cases:
             if not case.get('filtered_out', False):  # Only active PD cases
                 for party in case.get('parties', []):
                     if not party.get('is_state_party', False):
-                        pd_non_state_parties.add(party['name'].upper().strip())
+                        pd_non_state_parties.append(party['name'])
         
         print(f"🔍 Found {len(pd_non_state_parties)} unique non-state parties in active PD cases")
         
         # Determine which COA cases should have briefs downloaded
         eligible_coa_cases = []
         for case in coa_cases:
-            if case.get('filtered_out', False):
-                case['brief_download_reason'] = f"Filtered out: {case.get('filter_reason', 'Unknown')}"
-                continue
-            
-            # Check for non-state parties
+            # Check for non-state parties first
             non_state_parties = [p for p in case.get('parties', []) if not p.get('is_state_party', False)]
             if not non_state_parties:
                 case['brief_download_reason'] = "No non-state parties found"
+                case['filtered_out'] = True
+                case['filter_reason'] = 'No non-state parties'
                 continue
             
-            # Check if any non-state parties have concurrent PD cases
+            # Check if any non-state parties have concurrent PD cases (BEFORE mandate check)
             parties_with_pd_cases = []
             for party in non_state_parties:
-                party_name_upper = party['name'].upper().strip()
-                if party_name_upper in pd_non_state_parties:
-                    parties_with_pd_cases.append(party['name'])
+                coa_party_name = party['name']
+                # Check if this COA party matches any PD party
+                for pd_party_name in pd_non_state_parties:
+                    if names_match(coa_party_name, pd_party_name):
+                        parties_with_pd_cases.append(f"{coa_party_name} (matches PD: {pd_party_name})")
+                        break  # Found a match, no need to check other PD parties
             
             if parties_with_pd_cases:
                 case['brief_download_reason'] = f"Parties have concurrent PD cases: {', '.join(parties_with_pd_cases)}"
+                case['filtered_out'] = True
+                case['filter_reason'] = 'Concurrent PD cases'
+                continue
+            
+            # NOW check if mandate has been issued (after PD case check)
+            if case.get('mandate_issued', False):
+                case['brief_download_reason'] = "Mandate has been issued"
+                case['filtered_out'] = True
+                case['filter_reason'] = 'Mandate issued'
                 continue
             
             # This case is eligible for brief download
