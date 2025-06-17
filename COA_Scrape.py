@@ -991,6 +991,59 @@ def generate_pdf_report(all_case_details, output_folder):
     print(f"✅ Generated PDF report: {pdf_file}")
     return pdf_file
 
+def count_pdf_pages(pdf_path):
+    """Count the number of pages in a PDF file"""
+    try:
+        import PyPDF2
+        with open(pdf_path, 'rb') as f:
+            reader = PyPDF2.PdfReader(f)
+            return len(reader.pages)
+    except Exception as e:
+        # Fallback: estimate based on file size (rough approximation)
+        try:
+            import os
+            file_size = os.path.getsize(pdf_path)
+            # Very rough estimate: ~50KB per page on average
+            estimated_pages = max(1, file_size // 50000)
+            print(f"    ⚠️  Could not count pages for {pdf_path}, estimating {estimated_pages} pages")
+            return estimated_pages
+        except:
+            print(f"    ⚠️  Could not count pages for {pdf_path}, assuming 10 pages")
+            return 10  # Conservative fallback
+
+def create_optimal_batches(briefs_with_pages, max_pages=100):
+    """Create optimal batches of briefs that stay under the page limit"""
+    batches = []
+    current_batch = []
+    current_pages = 0
+    
+    for brief_path, brief_description, page_count in briefs_with_pages:
+        # If this single brief exceeds the limit, put it in its own batch
+        if page_count > max_pages:
+            if current_batch:
+                batches.append(current_batch)
+                current_batch = []
+                current_pages = 0
+            batches.append([(brief_path, brief_description, page_count)])
+            continue
+        
+        # If adding this brief would exceed the limit, start a new batch
+        if current_pages + page_count > max_pages:
+            if current_batch:
+                batches.append(current_batch)
+            current_batch = [(brief_path, brief_description, page_count)]
+            current_pages = page_count
+        else:
+            # Add to current batch
+            current_batch.append((brief_path, brief_description, page_count))
+            current_pages += page_count
+    
+    # Add the last batch if it has content
+    if current_batch:
+        batches.append(current_batch)
+    
+    return batches
+
 def analyze_briefs_with_claude(brief_paths_and_descriptions, case_number):
     """Analyze multiple legal brief PDFs with Claude to extract legal issues"""
     try:
@@ -1275,72 +1328,58 @@ def analyze_case_briefs(case_details, output_folder):
     
     all_issues = []
     
-    # Try to analyze briefs with progressive fallback
-    def try_analyze_briefs_progressively(briefs_list):
-        """Try to analyze briefs with progressive fallback to smaller groups"""
-        if len(briefs_list) == 1:
-            # Single brief - analyze individually
-            brief_path, brief_description = briefs_list[0]
-            print(f"    📄 Analyzing single brief: {brief_description}")
+    # Count pages for each brief and create optimal batches
+    print(f"  📊 Counting pages for {len(valid_briefs)} briefs...")
+    briefs_with_pages = []
+    total_pages = 0
+    
+    for brief_path, brief_description in valid_briefs:
+        page_count = count_pdf_pages(brief_path)
+        briefs_with_pages.append((brief_path, brief_description, page_count))
+        total_pages += page_count
+        print(f"    📄 {brief_description}: {page_count} pages")
+    
+    print(f"  📊 Total pages: {total_pages}")
+    
+    # Create optimal batches (max 100 pages per batch)
+    batches = create_optimal_batches(briefs_with_pages, max_pages=100)
+    
+    print(f"  📦 Created {len(batches)} batch(es) for analysis:")
+    for i, batch in enumerate(batches, 1):
+        batch_pages = sum(pages for _, _, pages in batch)
+        batch_descriptions = [desc for _, desc, _ in batch]
+        print(f"    Batch {i}: {len(batch)} brief(s), {batch_pages} pages")
+        for desc in batch_descriptions:
+            print(f"      - {desc}")
+    
+    # Analyze each batch
+    for i, batch in enumerate(batches, 1):
+        batch_briefs = [(path, desc) for path, desc, _ in batch]
+        batch_pages = sum(pages for _, _, pages in batch)
+        
+        print(f"  🔍 Analyzing batch {i}/{len(batches)} ({len(batch_briefs)} brief(s), {batch_pages} pages)...")
+        
+        if len(batch_briefs) > 1:
+            # Multiple briefs in batch - analyze together
+            issues = analyze_briefs_with_claude(batch_briefs, case_number)
+            
+            if issues:
+                print(f"    ✅ Found {len(issues)} legal issues from batch {i}")
+                all_issues.extend(issues)
+            else:
+                print(f"    ⚠️  No issues found from batch {i}")
+        else:
+            # Single brief in batch
+            brief_path, brief_description = batch_briefs[0]
             issues = analyze_brief_with_claude(brief_path, case_number, brief_description)
             
             if issues:
-                print(f"      ✅ Found {len(issues)} legal issues")
+                print(f"    ✅ Found {len(issues)} legal issues from {brief_description}")
                 for issue in issues:
                     issue['source_brief'] = brief_description
-                return issues
+                    all_issues.append(issue)
             else:
-                print(f"      ⚠️  No legal issues identified")
-                return []
-        
-        # Try analyzing all briefs together
-        print(f"    📄 Analyzing {len(briefs_list)} briefs together...")
-        issues = analyze_briefs_with_claude(briefs_list, case_number)
-        
-        if issues is None:
-            # Size limit error - try smaller groups
-            if len(briefs_list) == 2:
-                print(f"    🔄 Two briefs too large, analyzing individually...")
-                # Analyze each brief individually
-                all_individual_issues = []
-                for brief_path, brief_description in briefs_list:
-                    print(f"      📄 Analyzing: {brief_description}")
-                    individual_issues = analyze_brief_with_claude(brief_path, case_number, brief_description)
-                    
-                    if individual_issues:
-                        print(f"        ✅ Found {len(individual_issues)} legal issues")
-                        for issue in individual_issues:
-                            issue['source_brief'] = brief_description
-                            all_individual_issues.append(issue)
-                    else:
-                        print(f"        ⚠️  No legal issues identified")
-                return all_individual_issues
-            else:
-                # More than 2 briefs - try splitting into smaller groups
-                print(f"    🔄 {len(briefs_list)} briefs too large, trying smaller groups...")
-                mid_point = len(briefs_list) // 2
-                first_half = briefs_list[:mid_point]
-                second_half = briefs_list[mid_point:]
-                
-                print(f"    🔄 Trying first group of {len(first_half)} briefs...")
-                first_issues = try_analyze_briefs_progressively(first_half)
-                
-                print(f"    🔄 Trying second group of {len(second_half)} briefs...")
-                second_issues = try_analyze_briefs_progressively(second_half)
-                
-                return first_issues + second_issues
-        elif issues:
-            print(f"      ✅ Found {len(issues)} legal issues from combined analysis")
-            return issues
-        else:
-            print(f"      ⚠️  No legal issues identified from combined analysis")
-            return []
-    
-    if len(valid_briefs) > 0:
-        print(f"  📄 Starting analysis of {len(valid_briefs)} briefs...")
-        all_issues = try_analyze_briefs_progressively(valid_briefs)
-    else:
-        all_issues = []
+                print(f"    ⚠️  No issues found from {brief_description}")
     
     # Remove duplicate issues (for fallback individual analysis)
     unique_issues = []
